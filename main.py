@@ -796,7 +796,7 @@ input{padding:8px;border:0;border-radius:4px;background:#1e1f22;color:#fff}
    <div id=ctl>
     <button id=micb onclick="toggleMic()"></button>
     <button id=camb onclick="toggleCam()"></button>
-    <button class=danger onclick="leaveCall()">📞 退出</button>
+    <button class=danger onclick="leaveCall()">退出</button>
    </div>
   </div>
   <div id=msgs></div><div id=prog></div>
@@ -814,7 +814,7 @@ input{padding:8px;border:0;border-radius:4px;background:#1e1f22;color:#fff}
 
 <script>
 const $=id=>document.getElementById(id);
-const EMOJI=["👍","❤️","😂","🎉","😮","😢"];
+const EMOJI=["👍","❤️","😂","🎉","😮","😢",🖕"];
 /* 通話の音声設定: noiseSuppression=false でノイズキャンセルなし。
    スピーカーで通話してエコーが気になる場合は echoCancellation を true のまま、
    不要なら false にしてください (イヤホン使用時は false でもOK) */
@@ -981,7 +981,7 @@ async function drawMembers(){
   d.members.forEach(m=>{
     const e=document.createElement("div");e.className="mem";
     const dot=document.createElement("span");dot.className="dot"+(m.online?" on":"");
-    e.append(dot,(m.owner?"👑 ":"")+m.name);
+    e.append(dot,(m.owner?"管理者 ":"")+m.name);
     if(m.roles.length){const r=document.createElement("small");r.textContent=m.roles.join(", ");e.append(r)}
     if(m.id!==S.me.id)e.onclick=()=>openDm(m.name);
     p.append(e);
@@ -1203,8 +1203,8 @@ function drawCall(){
   if(!call){box.hidden=true;tiles.innerHTML="";updateCallBtn();return}
   box.hidden=false;
   $("calltitle").textContent="通話中: "+chanName(call.channel);
-  $("micb").textContent=call.mic?"🎤 マイクON":"🔇 ミュート中";$("micb").className=call.mic?"":"offb";
-  $("camb").textContent=call.cam?"📷 カメラON":"📷 カメラOFF";$("camb").className=call.cam?"":"offb";
+  $("micb").textContent=call.mic?"マイクON":"ミュート中";$("micb").className=call.mic?"":"offb";
+  $("camb").textContent=call.cam?"カメラON":"カメラOFF";$("camb").className=call.cam?"":"offb";
   const users=S.calls[call.channel]||[],keep=new Set();
   users.forEach(u=>{
     const id="t"+u.id;keep.add(id);
@@ -1217,7 +1217,7 @@ function drawCall(){
       t.append(v,av,nm);tiles.append(t);
     }
     t.classList.toggle("cam",!!u.cam);t.classList.toggle("off",!u.mic);
-    t.querySelector(".nm").textContent=(u.mic?"":"🔇 ")+u.name;
+    t.querySelector(".nm").textContent=(u.mic?"":"ミュート中 ")+u.name;
     const v=t.querySelector("video");
     let src=null;
     if(u.id===S.me.id)src=call.cam?call.preview:null;
@@ -1230,7 +1230,7 @@ function drawCall(){
 function updateCallBtn(){
   const b=$("callbtn");
   b.hidden=!callable(S.chan);
-  b.textContent=call&&call.channel===S.chan?"📞 通話から退出":"📞 通話に参加";
+  b.textContent=call&&call.channel===S.chan?"通話から退出":"通話に参加";
   b.style.background=call&&call.channel===S.chan?"#da373c":"#23a559";
 }
 const callBtn=()=>{if(call&&call.channel===S.chan)leaveCall();else joinCall(S.chan)};
@@ -1239,7 +1239,7 @@ function drawRing(){
   S.dms.forEach(c=>{
     const u=S.calls[c.id];
     if(u&&u.length&&!(call&&call.channel===c.id)){
-      const d=document.createElement("div");d.textContent=`📞 ${c.name} と通話中です`;
+      const d=document.createElement("div");d.textContent=` ${c.name} と通話中です`;
       const b=document.createElement("button");b.textContent="参加する";
       b.onclick=async()=>{setView("dm");await openChan(c.id);joinCall(c.id)};
       d.append(b);r.append(d);
