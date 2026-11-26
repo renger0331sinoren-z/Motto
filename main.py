@@ -1,5 +1,5 @@
 """
-MiniCord v3 -- Discord風チャット
+Motto v3 -- Discord風チャット
 FastAPI + WebSocket + WebRTC + SQLite
 
 起動:
@@ -1557,7 +1557,7 @@ async def ws_endpoint(ws: WebSocket, token: str = ""):
 PAGE = r"""<!doctype html>
 <meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
-<title>MiniCord</title>
+<title>Motto</title>
 
 <style>
 *{box-sizing:border-box}
@@ -1640,8 +1640,8 @@ input{padding:8px;border:0;border-radius:4px;background:#1e1f22;color:#fff}
 
 <div id=auth>
  <div id=authbox>
-  <img id=logo src="data:image/png;base64,LOGO_PLACEHOLDER" alt="MiniCord">
-  <h2 style="margin:0;text-align:center">MiniCord</h2>
+  <img id=logo src="data:image/png;base64,LOGO_PLACEHOLDER" alt="Motto">
+  <h2 style="margin:0;text-align:center"></h2>
   <input id=an placeholder="ユーザー名">
   <input id=ap type=password placeholder="パスワード(6文字以上)">
   <div id=aerr></div>
