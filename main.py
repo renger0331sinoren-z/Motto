@@ -814,7 +814,7 @@ input{padding:8px;border:0;border-radius:4px;background:#1e1f22;color:#fff}
 
 <script>
 const $=id=>document.getElementById(id);
-const EMOJI=["👍","❤️","😂","🎉","😮","😢",🖕"];
+const EMOJI=["👍","❤️","😂","🎉","😮","😢","🖕"];
 /* 通話の音声設定: noiseSuppression=false でノイズキャンセルなし。
    スピーカーで通話してエコーが気になる場合は echoCancellation を true のまま、
    不要なら false にしてください (イヤホン使用時は false でもOK) */
