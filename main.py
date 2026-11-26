@@ -39,13 +39,16 @@ async def get_logo():
 # ロゴ画像
 # ------------------------------------------------------------------
 
-LOGO_PATH = Path(r"C:\Users\renge\Downloads\M.png")
+LOGO_PATH = Path(__file__).parent / "M.png"
 
 if not LOGO_PATH.is_file():
-    raise FileNotFoundError("ロゴ画像が見つかりません: {LOGO_PATH}")
-f
-LOGO_BASE64 = base64.b64encode(LOGO_PATH.read_bytes()).decode("ascii")
+    raise FileNotFoundError(
+        f"ロゴ画像が見つかりません: {LOGO_PATH}"
+    )
 
+LOGO_BASE64 = base64.b64encode(
+    LOGO_PATH.read_bytes()
+).decode("ascii")
 # ------------------------------------------------------------------
 # 基本設定
 # ------------------------------------------------------------------
