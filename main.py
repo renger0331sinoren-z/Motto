@@ -2007,12 +2007,23 @@ function drawRail(){
   r.append(b);
  };
 
- mk(
-  "🏠",
+mk(
+  "",
   "ホーム (フレンド / DM)",
   ()=>setView("dm"),
   S.view==="dm"
- );
+);
+
+const homeBtn = r.lastElementChild;
+const logo = document.createElement("img");
+
+logo.src = "/M.png";
+logo.alt = "ホーム";
+logo.style.width = "24px";
+logo.style.height = "24px";
+logo.style.objectFit = "contain";
+
+homeBtn.appendChild(logo);
 
  S.servers.forEach(s=>{
   mk(
