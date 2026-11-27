@@ -52,7 +52,7 @@ UPLOADS = DATA / "uploads"
 UPLOADS.mkdir(exist_ok=True)
 MAX_STAMP = 5 * 1024 * 1024  # スタンプ画像は5MBまで (通常ファイルは無制限)
 MAX_EMOJI = 512 * 1024  # オリジナル絵文字は512KBまで
-MAX_MEDIA = 30 * 1024 * 1024  # バナー / 背景(画像・動画)は30MBまで
+MAX_MEDIA = None  # バナー / 背景(画像・動画)は無制限
 MEDIA_KINDS = ("banner", "bg")
 MAX_AVATAR = 2 * 1024 * 1024  # アカウント / サーバーのアイコンは2MBまで
 OWNER_NAME = os.environ.get("OWNER_NAME", "レンジャー").strip()  # サイトの管理者の名前 (公式アナウンスを投稿できるのはこの人だけ)
@@ -81,6 +81,7 @@ create table if not exists friends(user_id integer, friend_id integer, primary k
 create table if not exists stamps(id integer primary key autoincrement, name text, file_id text, mime text, owner_id integer, hidden integer default 0);
 create table if not exists emojis(id integer primary key autoincrement, name text, file_id text, mime text, owner_id integer, hidden integer default 0);
 create table if not exists kv(k text primary key, v text);
+create table if not exists blobs(id text primary key, data blob);
 create table if not exists push_subs(endpoint text primary key, user_id integer, sub text);
 create index if not exists idx_msg on messages(channel_id, id);
 """
@@ -88,6 +89,7 @@ MIGRATIONS = [  # 古いDB(v2/v3)からの移行
     ("messages", "stamp_id", "integer"),
     ("messages", "reply_to", "integer"),
     ("channels", "kind", "text default 'text'"),
+    ("channels", "owner_id", "integer"),
     ("users", "friend_code", "text"),
     ("users", "notify_mode", "text default 'mention'"),
     ("servers", "is_public", "integer default 0"),
@@ -110,7 +112,7 @@ MIGRATIONS = [  # 古いDB(v2/v3)からの移行
     ("users", "bg_opacity", "integer default 100"),
 ]
 _ID_TABLES = {"users", "servers", "roles", "channels", "messages", "stamps", "emojis"}  # id列があるテーブル
-_UPSERT = {"kv": ("k", ["v"]), "push_subs": ("endpoint", ["user_id", "sub"])}
+_UPSERT = {"blobs": ("id", ["data"]), "kv": ("k", ["v"]), "push_subs": ("endpoint", ["user_id", "sub"])}
 
 
 def pg_type(sql):
@@ -243,6 +245,56 @@ else:
         if not _has_col(_t, _c):
             db.execute(f"alter table {_t} add column {_c} {_d}")
 db.commit()
+
+
+# ------------------------------------------------------------------ アップロードファイルをDBにも控える
+# DATABASE_URL (外部DB) を使っているときだけ有効。再デプロイでディスクが消えても、起動時にDBから復元する。
+MIRROR_MAX = int(os.environ.get("MIRROR_MAX_MB", "50")) * 1024 * 1024
+
+
+def mirror_file(fid):
+    if not DATABASE_URL:
+        return
+    try:
+        path = UPLOADS / fid
+        if not path.exists() or path.stat().st_size > MIRROR_MAX:
+            return
+        data = path.read_bytes()
+        db.execute("insert or replace into blobs values(?,?)", (fid, db.pg.Binary(data)))
+    except Exception as e:  # noqa
+        print("ファイルのバックアップに失敗:", e)
+
+
+def rm_file(fid):
+    if not fid:
+        return
+    (UPLOADS / fid).unlink(missing_ok=True)
+    if DATABASE_URL:
+        try:
+            db.execute("delete from blobs where id=?", (fid,))
+        except Exception:
+            pass
+
+
+def restore_blobs():
+    if not DATABASE_URL:
+        return
+    n = 0
+    try:
+        for (fid,) in db.execute("select id from blobs").fetchall():
+            if not re.fullmatch(r"[0-9a-f]{32}", fid) or (UPLOADS / fid).exists():
+                continue
+            r = db.execute("select data from blobs where id=?", (fid,)).fetchone()
+            if r and r[0] is not None:
+                (UPLOADS / fid).write_bytes(bytes(r[0]))
+                n += 1
+        if n:
+            print(f"DBからファイルを {n} 件復元しました")
+    except Exception as e:  # noqa
+        print("ファイルの復元に失敗:", e)
+
+
+restore_blobs()
 
 # 公式アナウンス用の特別なチャンネル (全員が読めて、オーナーだけが投稿できる)
 _a = db.execute("select id from channels where kind='announce'").fetchone()
@@ -567,9 +619,18 @@ async def me(u=Depends(current_user)):
         "select c.id,u2.id,u2.name from channels c "
         "join dm_members d on d.channel_id=c.id and d.user_id=? "
         "join dm_members d2 on d2.channel_id=c.id and d2.user_id!=? "
-        "join users u2 on u2.id=d2.user_id where c.server_id is null and c.kind!='announce' order by c.id", (uid, uid)
+        "join users u2 on u2.id=d2.user_id where c.server_id is null and coalesce(c.kind,'') not in ('announce','group') order by c.id", (uid, uid)
     ):
         dms.append({"id": cid, "name": pname, "uid": pid, "online": bool(hub.users.get(pid))})
+    for gid, gname, gowner in db.execute(
+        "select c.id,c.name,c.owner_id from channels c join dm_members d on d.channel_id=c.id and d.user_id=? "
+        "where c.server_id is null and c.kind='group' order by c.id", (uid,)
+    ).fetchall():
+        mem = [
+            {"id": i, "name": n, "online": bool(hub.users.get(i))}
+            for i, n in db.execute("select u.id,u.name from dm_members d join users u on u.id=d.user_id where d.channel_id=? order by u.name", (gid,))
+        ]
+        dms.append({"id": gid, "name": gname, "uid": None, "online": False, "group": True, "members": mem, "owner": gowner == uid})
     row = db.execute("select friend_code,notify_mode from users where id=?", (uid,)).fetchone()
     code = row[0]
     if not code:
@@ -589,7 +650,7 @@ async def me(u=Depends(current_user)):
     return {
         "user": u, "servers": servers, "dms": dms, "friend_code": code, "friends": friends, "calls": calls,
         "notify_mode": row[1] or "mention", "push_available": HAVE_PUSH,
-        "announce": ANNOUNCE_CID, "is_owner": is_site_owner(uid),
+        "announce": ANNOUNCE_CID, "is_owner": is_site_owner(uid), "persistent": bool(DATABASE_URL),
     }
 
 
@@ -666,7 +727,7 @@ async def set_avatar(request: Request, u=Depends(current_user)):
     db.execute("update users set avatar_file=?,avatar_mime=?,avatar_ver=? where id=?", (fid, mime, int(time.time()), u["id"]))
     db.commit()
     if old and old[0]:
-        (UPLOADS / old[0]).unlink(missing_ok=True)
+        rm_file(old[0])
     await push(list(hub.users.keys()), {"type": "profile"})
     return {"ok": True}
 
@@ -677,7 +738,7 @@ async def delete_avatar(u=Depends(current_user)):
     db.execute("update users set avatar_file=NULL,avatar_mime=NULL,avatar_ver=NULL where id=?", (u["id"],))
     db.commit()
     if old and old[0]:
-        (UPLOADS / old[0]).unlink(missing_ok=True)
+        rm_file(old[0])
     await push(list(hub.users.keys()), {"type": "profile"})
     return {"ok": True}
 
@@ -691,7 +752,7 @@ async def set_media(kind: str, request: Request, u=Depends(current_user)):
     db.execute(f"update users set {kind}_file=?,{kind}_mime=?,{kind}_ver=? where id=?", (fid, mime, int(time.time()), u["id"]))
     db.commit()
     if old and old[0]:
-        (UPLOADS / old[0]).unlink(missing_ok=True)
+        rm_file(old[0])
     await push(list(hub.users.keys()), {"type": "profile"})
     return {"ok": True}
 
@@ -704,7 +765,7 @@ async def delete_media(kind: str, u=Depends(current_user)):
     db.execute(f"update users set {kind}_file=NULL,{kind}_mime=NULL,{kind}_ver=NULL where id=?", (u["id"],))
     db.commit()
     if old and old[0]:
-        (UPLOADS / old[0]).unlink(missing_ok=True)
+        rm_file(old[0])
     await push(list(hub.users.keys()), {"type": "profile"})
     return {"ok": True}
 
@@ -887,7 +948,7 @@ async def set_server_icon(sid: int, request: Request, u=Depends(current_user)):
     db.execute("update servers set icon_file=?,icon_mime=?,icon_ver=? where id=?", (fid, mime, int(time.time()), sid))
     db.commit()
     if old and old[0]:
-        (UPLOADS / old[0]).unlink(missing_ok=True)
+        rm_file(old[0])
     await push(server_users(sid), {"type": "refresh"})
     return {"ok": True}
 
@@ -900,7 +961,7 @@ async def delete_server_icon(sid: int, u=Depends(current_user)):
     db.execute("update servers set icon_file=NULL,icon_mime=NULL,icon_ver=NULL where id=?", (sid,))
     db.commit()
     if old and old[0]:
-        (UPLOADS / old[0]).unlink(missing_ok=True)
+        rm_file(old[0])
     await push(server_users(sid), {"type": "refresh"})
     return {"ok": True}
 
@@ -1000,7 +1061,7 @@ async def open_dm(b: dict, u=Depends(current_user)):
     if t[0] == u["id"]:
         raise HTTPException(400, "自分にはDMを送れません")
     r = db.execute(
-        "select c.id from channels c where c.server_id is null "
+        "select c.id from channels c where c.server_id is null and coalesce(c.kind,'') not in ('group','announce') "
         "and exists(select 1 from dm_members where channel_id=c.id and user_id=?) "
         "and exists(select 1 from dm_members where channel_id=c.id and user_id=?)", (u["id"], t[0])
     ).fetchone()
@@ -1012,6 +1073,82 @@ async def open_dm(b: dict, u=Depends(current_user)):
     await push([u["id"], t[0]], {"type": "refresh"})
     return {"id": cid}
 
+
+
+
+# ------------------------------------------------------------------ グループ (3人以上のチャット / 通話)
+def _group_member(uid, cid):
+    r = db.execute("select c.name from channels c join dm_members d on d.channel_id=c.id and d.user_id=? "
+                   "where c.id=? and c.kind='group' and c.server_id is null", (uid, cid)).fetchone()
+    if not r:
+        raise HTTPException(404, "グループが見つかりません")
+    return r[0]
+
+
+def _user_ids(names):
+    ids = []
+    for n in names:
+        r = db.execute("select id from users where name=?", (str(n).strip(),)).fetchone()
+        if r and r[0] not in ids:
+            ids.append(r[0])
+    return ids
+
+
+@app.post("/api/groups")
+async def group_create(b: dict, u=Depends(current_user)):
+    name = str(b.get("name", "")).strip()[:30]
+    if not name:
+        raise HTTPException(400, "グループ名を入れてください")
+    ids = [i for i in _user_ids(b.get("members") or []) if i != u["id"]][:49]
+    cid = db.execute("insert into channels(server_id,name,kind,owner_id) values(NULL,?,'group',?)", (name, u["id"])).lastrowid
+    db.executemany("insert into dm_members values(?,?)", [(cid, x) for x in [u["id"]] + ids])
+    db.commit()
+    await push([u["id"]] + ids, {"type": "refresh"})
+    return {"id": cid}
+
+
+@app.post("/api/groups/{cid}/add")
+async def group_add(cid: int, b: dict, u=Depends(current_user)):
+    _group_member(u["id"], cid)
+    have = {r[0] for r in db.execute("select user_id from dm_members where channel_id=?", (cid,))}
+    if len(have) >= 50:
+        raise HTTPException(400, "グループは50人までです")
+    ids = [i for i in _user_ids(b.get("names") or []) if i not in have]
+    db.executemany("insert or ignore into dm_members values(?,?)", [(cid, x) for x in ids])
+    db.commit()
+    await push(list(have) + ids, {"type": "refresh"})
+    return {"ok": True, "added": len(ids)}
+
+
+@app.post("/api/groups/{cid}/rename")
+async def group_rename(cid: int, b: dict, u=Depends(current_user)):
+    _group_member(u["id"], cid)
+    name = str(b.get("name", "")).strip()[:30]
+    if not name:
+        raise HTTPException(400, "グループ名を入れてください")
+    db.execute("update channels set name=? where id=?", (name, cid))
+    db.commit()
+    await push(channel_users(cid), {"type": "refresh"})
+    return {"ok": True}
+
+
+@app.post("/api/groups/{cid}/leave")
+async def group_leave(cid: int, u=Depends(current_user)):
+    _group_member(u["id"], cid)
+    users = channel_users(cid)
+    await call_leave(u["id"], cid)
+    db.execute("delete from dm_members where channel_id=? and user_id=?", (cid, u["id"]))
+    if not db.execute("select 1 from dm_members where channel_id=?", (cid,)).fetchone():
+        for r in db.execute("select file_id from messages where channel_id=? and file_id is not null", (cid,)).fetchall():
+            rm_file(r[0])
+        ids = [r[0] for r in db.execute("select id from messages where channel_id=?", (cid,)).fetchall()]
+        for mid in ids:
+            db.execute("delete from reactions where message_id=?", (mid,))
+        db.execute("delete from messages where channel_id=?", (cid,))
+        db.execute("delete from channels where id=?", (cid,))
+    db.commit()
+    await push(users, {"type": "refresh"})
+    return {"ok": True}
 
 # ------------------------------------------------------------------ 画像(スタンプ / オリジナル絵文字)
 def sniff_image(h: bytes):
@@ -1045,7 +1182,7 @@ async def save_image(request: Request, limit: int, sniff=None):
         with open(path, "wb") as f:
             async for chunk in request.stream():
                 size += len(chunk)
-                if size > limit:
+                if limit and size > limit:
                     raise HTTPException(413, f"ファイルは{limit / 1048576:g}MBまでです")
                 if len(head) < 16:
                     head += chunk[: 16 - len(head)]
@@ -1056,6 +1193,7 @@ async def save_image(request: Request, limit: int, sniff=None):
     except BaseException:
         path.unlink(missing_ok=True)
         raise
+    await asyncio.to_thread(mirror_file, fid)
     return fid, mime
 
 
@@ -1341,7 +1479,7 @@ async def delete_message(mid: int, u=Depends(current_user)):
     db.execute("delete from messages where id=?", (mid,))
     db.commit()
     if r[2]:
-        (UPLOADS / r[2]).unlink(missing_ok=True)
+        rm_file(r[2])
     await push(users, {"type": "message_delete", "channel": cid, "id": mid})
     return {"ok": True}
 
@@ -1360,6 +1498,7 @@ async def upload(cid: int, request: Request, name: str = "file",
     except BaseException:
         path.unlink(missing_ok=True)  # 途中で切れたら破棄
         raise
+    await asyncio.to_thread(mirror_file, fid)
     await post_message(u["id"], cid, "", (fid, name[:200], type[:100]))
     return {"ok": True}
 
@@ -1844,6 +1983,72 @@ input:focus,select:focus,textarea:focus{box-shadow:0 0 0 3px color-mix(in srgb,v
  #rail{width:100%;height:calc(68px + var(--sat));padding:var(--sat) 12px 0;flex:none}
  #side{width:100%;flex:1;min-height:0}
 }
+
+/* ======== v5.1: 発言リング / グループ / 設定画面 / アイコン切り抜き ======== */
+.av{transition:box-shadow .15s}
+.speaking>.av,.speaking>.avw>.av,.tile.speaking .av,.vu.speaking .av,.mem.speaking .av{box-shadow:0 0 0 3px var(--bg3),0 0 0 6px var(--ok),0 0 16px var(--ok)}
+.vu.speaking .av,.mem.speaking .av{box-shadow:0 0 0 2px var(--bg2),0 0 0 4px var(--ok)}
+.tile.speaking{border-color:var(--ok);box-shadow:0 0 0 2px var(--ok)}
+.gav{background:var(--grad);color:#fff}
+.addbar.sm{width:auto;flex:1;padding:6px 8px;font-size:12px;border-width:1.5px;border-radius:11px;margin-bottom:0;gap:5px;box-shadow:none;white-space:nowrap}
+.homeact{display:flex;gap:6px;margin-bottom:10px}
+.fpick{display:flex;flex-direction:column;gap:2px;max-height:260px;overflow-y:auto}
+.fprow{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:12px;cursor:pointer;color:var(--tx)!important;font-size:14px!important}
+.fprow:hover{background:var(--hov)}
+.m .mt,.mt{font-size:var(--mfs,15px)}
+body.compact .m:not(.g){margin-top:3px}body.compact .m{padding:1px 8px}
+body.reduce *{animation:none!important;transition:none!important}
+body.hc{--tx2:#d5d8ea}:root[data-theme=light] body.hc{--tx2:#2b2e44}
+body.big button{min-height:44px}
+
+.crop{position:fixed;inset:0;z-index:250;background:#000c;backdrop-filter:blur(6px);display:flex;align-items:center;justify-content:center;padding:16px}
+.cropbox{background:var(--bg2);border:1px solid var(--line);border-radius:20px;padding:18px;display:flex;flex-direction:column;align-items:center;gap:12px;max-width:100%;box-shadow:0 30px 80px #000a}
+.cropstage{position:relative;border-radius:16px;overflow:hidden;touch-action:none;cursor:grab;background:#000}
+.cropstage canvas{display:block;width:100%;height:100%}
+.cropmask{position:absolute;inset:8%;border-radius:50%;box-shadow:0 0 0 999px #000a;border:2px solid #fff;pointer-events:none}
+.cropbox input[type=range]{width:100%;padding:0}
+
+.set{position:fixed;inset:0;z-index:120;background:var(--bg);display:flex}
+.setnav{width:max(250px,28vw);flex:none;background:var(--bg2);border-right:1px solid var(--line);padding:calc(24px + var(--sat)) 12px 16px;display:flex;flex-direction:column;gap:3px;overflow-y:auto;align-items:stretch}
+.setttl{font-size:12px;letter-spacing:.1em;color:var(--tx2);padding:4px 12px 10px}
+.sitem{background:transparent;color:var(--tx);justify-content:flex-start;padding:10px 12px;border-radius:10px;font-weight:600;gap:11px}
+.sitem:hover{background:var(--hov2);filter:none}
+.sitem.on{background:color-mix(in srgb,var(--acc) 22%,transparent);color:var(--hi);box-shadow:inset 3px 0 0 var(--acc)}
+.sitem.dng{color:var(--bad)}
+.ssp{flex:1;min-height:12px}
+.setbody{flex:1;min-width:0;overflow-y:auto;padding:0 28px 60px;position:relative}
+.settop{position:sticky;top:0;z-index:2;display:flex;align-items:center;gap:10px;padding:calc(18px + var(--sat)) 0 12px;background:var(--bg);border-bottom:1px solid var(--line);margin-bottom:6px}
+.setct{flex:1;font-size:20px}
+.setin{max-width:680px}
+.srow{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 0;border-bottom:1px solid var(--line);flex-wrap:wrap}
+.srow .st{display:flex;flex-direction:column;gap:3px;min-width:0;flex:1 1 220px}
+.srow small{color:var(--tx2);font-size:12.5px;line-height:1.4;word-break:break-all}
+.srow select{width:auto;max-width:100%;flex:0 1 260px}
+.srange{display:flex;align-items:center;gap:10px;flex:0 1 240px}.srange input{padding:0}.srange .muted{min-width:42px;margin:0;text-align:right}
+.sh3{font-size:12px;letter-spacing:.08em;color:var(--tx2);margin:22px 0 2px}
+.snote{margin:14px 0;padding:12px 14px;border-radius:12px;background:var(--bg3);border:1px solid var(--line);color:var(--tx2);font-size:13.5px;line-height:1.6}
+.snote.ok{border-color:var(--ok);color:var(--ok)}.snote.warn{border-color:#f59e0b;color:#f59e0b}
+.pcard{display:flex;align-items:center;gap:14px;padding:16px;border-radius:16px;background:linear-gradient(135deg,color-mix(in srgb,var(--acc) 22%,var(--bg3)),var(--bg3));border:1px solid var(--line);margin:10px 0}
+.pcard .pci{display:flex;flex-direction:column;gap:3px;min-width:0}.pcard b{font-size:18px}.pcard small{color:var(--tx2)}
+.sw{position:relative;display:inline-block;width:46px;height:26px;flex:none;cursor:pointer}
+.sw input{position:absolute;opacity:0;inset:0;width:100%;height:100%;margin:0;cursor:pointer}
+.sw .knob{position:absolute;inset:0;border-radius:26px;background:var(--bg4);transition:background .2s}
+.sw .knob::after{content:"";position:absolute;left:3px;top:3px;width:20px;height:20px;border-radius:50%;background:#fff;transition:transform .2s;box-shadow:0 1px 4px #0005}
+.sw input:checked+.knob{background:var(--ok)}.sw input:checked+.knob::after{transform:translateX(20px)}
+.swatches input[type=color]{width:34px;height:34px;padding:0;border-radius:50%;border:2px solid var(--line)}
+.setx,.setback{margin-left:auto}
+@media(max-width:820px){
+ .setnav{width:100%;border-right:0}
+ .setbody{padding:0 16px 60px}
+ .set[data-view=list] .setbody{display:none}
+ .set[data-view=detail] .setnav{display:none}
+ .setback{margin-left:0}
+ .srow .st{flex-basis:100%}.srow select,.srange{flex:1 1 100%}
+ .setnav .setttl{font-size:18px;color:var(--tx);letter-spacing:0;padding-right:48px}
+ .setx{position:absolute;right:12px;top:calc(14px + var(--sat))}
+ .setnav{position:relative}
+}
+@media(min-width:821px){.setback,.setx{display:none!important}}
 </style>
 
 <div id=auth>
@@ -1987,7 +2192,7 @@ const hhmm=t=>new Date(t*1000).toLocaleTimeString([],{hour:"2-digit",minute:"2-d
 const fullTime=t=>new Date(t*1000).toLocaleString([],{month:"numeric",day:"numeric",hour:"2-digit",minute:"2-digit"});
 
 /* ---------- 状態 ---------- */
-const S={token:localStorage.token||"",me:null,servers:[],dms:[],friends:[],code:"",calls:{},stamps:[],emojis:[],emap:{},av:{},announce:0,owner:false,homeTab:"f",callBig:false,
+const S={token:localStorage.token||"",me:null,servers:[],dms:[],friends:[],code:"",calls:{},stamps:[],emojis:[],emap:{},av:{},announce:0,owner:false,homeTab:"d",callBig:false,
  view:"dm",chan:null,unread:{},ment:{},ws:null,reply:null,notify:"mention",push:false,sound:localStorage.sound!=="0"};
 let call=null,toastT=0,modalCancel=null,last=null;
 const coarse=matchMedia("(pointer:coarse)").matches;
@@ -2018,14 +2223,6 @@ function copyText(t){
 }
 
 /* ---------- モーダル / フォーム ---------- */
-function closeModal(){const f=modalCancel;modalCancel=null;$("modal").hidden=true;$("mbox").innerHTML="";if(f)f()}
-function modal(title,nodes,onCancel){
-  closeModal();
-  const b=$("mbox"),h=el("div","mh"),t=el("b");t.textContent=title;
-  h.append(t,ibtn("x","",closeModal,"ghost sq","閉じる"));
-  b.append(h,...nodes);modalCancel=onCancel||null;$("modal").hidden=false;
-  const i=b.querySelector("input:not([type=checkbox])");if(i)setTimeout(()=>i.focus(),60);
-}
 $("modal").addEventListener("mousedown",e=>{if(e.target===$("modal"))closeModal()});
 function form(title,fields,ok="OK",pre=[]){
   return new Promise(res=>{
@@ -2085,7 +2282,7 @@ async function logout(){
 async function load(){
   const d=await api("/api/me");
   S.me=d.user;S.servers=d.servers;S.dms=d.dms;S.friends=d.friends;S.code=d.friend_code;S.calls=d.calls||{};
-  S.notify=d.notify_mode;S.push=d.push_available;S.announce=d.announce;S.owner=d.is_owner;
+  S.persistent=!!d.persistent;S.notify=d.notify_mode;S.push=d.push_available;S.announce=d.announce;S.owner=d.is_owner;
   if(S.view!=="dm"&&!S.servers.find(s=>s.id===S.view))S.view="dm";
   const mi=$("meinfo");mi.innerHTML="";const nm=el("span");nm.textContent=S.me.name;mi.append(avatar(S.me.name,"av sm2"),nm);mi.style.cursor="pointer";mi.onclick=()=>profileModal(S.me.name);
   drawRail();drawList();drawMembers();drawRing();updateCallBtn();drawNbar();
@@ -2093,6 +2290,7 @@ async function load(){
 async function boot(){
   try{await load()}catch(e){localStorage.removeItem("token");S.token="";$("auth").hidden=false;$("app").hidden=true;return}
   $("auth").hidden=true;$("app").hidden=false;
+  initHistory();
   connect();
   await Promise.all([loadStamps(),loadEmojis(),loadAvatars()]);
   setView("dm");
@@ -2128,7 +2326,7 @@ function onEvent(e){
   }else if(d.type==="refresh"){load().catch(()=>{})}
   else if(d.type==="presence"){
     const f=S.friends.find(x=>x.id===d.id);if(f)f.online=d.online;
-    S.dms.forEach(x=>{if(x.uid===d.id)x.online=d.online});
+    S.dms.forEach(x=>{if(x.uid===d.id)x.online=d.online;if(x.group)x.members.forEach(m=>{if(m.id===d.id)m.online=d.online})});
     if(S.view==="dm")drawList();else drawMembers();
   }
   else if(d.type==="stamps"){loadStamps()}
@@ -2228,9 +2426,6 @@ function callable(cid){
   if(S.dms.some(c=>c.id===cid))return true;
   return S.servers.some(s=>s.channels.some(c=>c.id===cid&&c.kind==="voice"));
 }
-const openNav=()=>{$("nav").classList.add("open");$("scrim").hidden=false};
-const openMem=()=>{$("members").classList.add("open");$("scrim").hidden=false};
-function closeDrawers(){$("nav").classList.remove("open");$("members").classList.remove("open");$("scrim").hidden=true}
 $("scrim").onclick=closeDrawers;
 
 function setView(v,cid){
@@ -2273,105 +2468,12 @@ function friendMenu(f){
   ]);
 }
 function openAnnounce(){S.view="dm";drawRail();drawMembers();openChan(S.announce)}
-function drawList(){
-  const h=$("sidehead"),l=$("list");h.innerHTML="";l.innerHTML="";
-  const badge=n=>{const b=el("span","badge");b.textContent=n;return b};
-  const hint=t=>{const p=el("p","muted");p.textContent=t;l.append(p)};
-  const chanRows=list=>list.forEach(c=>{
-    const wrap=el("div");
-    const d=el("div","ch"+(c.id===S.chan?" active":"")+(S.unread[c.id]?" unread":""));
-    const lead=S.view==="dm"?statusAvatar(c.name,"av xs",c.online):ico(c.kind==="voice"?"speaker":"hash",18);
-    const n=el("span","cn");n.textContent=c.name;d.append(lead,n);
-    const cu=S.calls[c.id]||[];
-    if(S.view==="dm"&&cu.length)d.append(ico("phone",15));
-    if(S.ment[c.id])d.append(badge(S.ment[c.id]));
-    d.onclick=()=>openChan(c.id);wrap.append(d);
-    if(c.kind==="voice")cu.forEach(u=>{
-      const v=el("div","vu");v.append(avatar(u.name,"av xs"));if(!u.mic)v.append(ico("micoff",13));
-      const nn=el("span");nn.textContent=u.name;v.append(nn);wrap.append(v);
-    });
-    l.append(wrap);
-  });
-  if(S.view==="dm"){
-    const t=el("span","t");t.textContent="ホーム";h.append(t);
-    const ab=el("button","addbar",ic("userplus",22)+"<span>フレンドを追加</span>");ab.onclick=addFriend;l.append(ab);
-    const seg=el("div","seg");
-    [["f","フレンド"],["d","DM"]].forEach(([k,tx])=>{const b=el("button",S.homeTab===k?"on":"");b.textContent=tx;b.onclick=()=>{S.homeTab=k;drawList()};seg.append(b)});
-    l.append(seg);
-    if(S.homeTab==="f"){
-      if(!S.friends.length)hint("まだフレンドがいません。上のボタンからフレンドコードで追加できます。");
-      S.friends.forEach(f=>{
-        const dm=S.dms.find(x=>x.uid===f.id);
-        const row=el("div","frow"+(f.online?"":" off")+(dm&&S.unread[dm.id]?" unread":""));
-        const n=el("span","fn");n.textContent=f.name;
-        row.append(statusAvatar(f.name,"av",f.online),n);
-        if(dm&&S.ment[dm.id])row.append(badge(S.ment[dm.id]));
-        row.append(ibtn("more","",e=>{e.stopPropagation();friendMenu(f)},"xb","メニュー"));
-        row.onclick=()=>openDm(f.name);l.append(row);
-      });
-    }else{
-      if(!S.dms.length)hint("DMはまだありません。フレンドを選んでメッセージを送ってみよう。");
-      chanRows(S.dms);
-    }
-  }else{
-    const s=curServer();if(!s)return;
-    const t=el("span","t");t.textContent=s.name;h.append(t,ibtn("gear","",serverMenu,"ghost sq","サーバー設定"));
-    chanRows(s.channels);
-  }
-  updateAnnBtn();updateTitle();
-}
 function updateAnnBtn(){
   const b=$("annb");if(!b)return;
   b.classList.toggle("active",S.chan===S.announce);
   b.querySelectorAll(".badge,.udot").forEach(x=>x.remove());
   if(S.ment[S.announce]){const x=el("span","badge");x.textContent=S.ment[S.announce];b.append(x)}
   else if(S.unread[S.announce])b.append(el("span","udot"));
-}
-async function drawMembers(){
-  const p=$("members");p.innerHTML="";
-  if(S.view==="dm"){
-    const h=el("h4");h.textContent="あなたのフレンドコード";p.append(h);
-    const c=el("div","code");c.textContent=S.code;p.append(c);
-    const row=el("div","row");row.style.justifyContent="flex-start";
-    row.append(ibtn("copy","コピー",()=>copyText(S.code),"ghost"),ibtn("gear","再発行",async()=>{if(await confirmBox("古いコードは使えなくなります。再発行しますか？","再発行"))T(()=>api("/api/friends/newcode","POST"))},"ghost"));
-    p.append(row);
-    const t=el("p","muted");t.textContent="このコードを友達に送ると、友達が「フレンドを追加」に入力してフレンドになれます。";p.append(t);
-    return;
-  }
-  const sid=S.view;let d;
-  try{d=await api(`/api/servers/${sid}/members`)}catch(e){return}
-  if(sid!==S.view)return;
-  const h=el("h4");h.textContent="メンバー  "+d.members.length;p.append(h);
-  d.members.forEach(m=>{
-    const e=el("div","mem"+(m.online?"":" off"));e.append(statusAvatar(m.name,"av sm2",m.online));
-    const i=el("div","mi"),n=el("span");n.textContent=m.name;
-    if(m.owner)n.append(el("span","tag","オーナー"));
-    i.append(n);
-    if(m.roles.length){const r=el("small");r.textContent=m.roles.join(", ");i.append(r)}
-    e.append(i);
-    e.onclick=()=>{closeDrawers();profileModal(m.name)};
-    p.append(e);
-  });
-}
-async function openChan(cid,auto){
-  S.chan=cid;S.unread[cid]=0;S.ment[cid]=0;last=null;clearReply();
-  if(!auto)closeDrawers();
-  drawList();
-  const isA=cid===S.announce;
-  const c=isA?{name:"公式アナウンス",kind:"announce"}:chanList().find(x=>x.id===cid);
-  const ht=$("headt");ht.innerHTML="";
-  if(c){
-    const lead=(isA||c.kind==="voice")?ico("speaker",19):(S.view==="dm"?statusAvatar(c.name,"av xs",c.online):ico("hash",19));
-    const nm=el("span");nm.textContent=c.name;ht.append(lead,nm);
-  }
-  $("profbtn").hidden=!(c&&S.view==="dm"&&!isA);
-  $("sq").placeholder=(c?c.name:"")+"を検索";
-  const ro=isA&&!S.owner;$("bar").hidden=ro;$("ronote").hidden=!ro;$("stampbox").hidden=true;
-  updateCallBtn();
-  $("msgs").innerHTML="";
-  const d=await T(()=>api(`/api/channels/${cid}/messages`));
-  if(!d||S.chan!==cid)return;
-  d.messages.forEach(addMsg);$("msgs").scrollTop=1e9;
 }
 
 /* ---------- メッセージ ---------- */
@@ -2499,7 +2601,6 @@ function renderReactions(d,r){
   }
 }
 const react=(mid,emoji)=>wsend({type:"react",message_id:mid,emoji});
-function headProfile(){const c=S.dms.find(x=>x.id===S.chan);if(c)profileModal(c.name)}
 async function doSearch(fromBtn){
   if(!S.chan)return;
   let q=$("sq").value.trim();
@@ -2534,7 +2635,7 @@ function sendMsg(){
   if(wsend({type:"send",channel:S.chan,text:v,reply_to:S.reply?S.reply.id:null})){$("txt").value="";clearReply()}
   else toast("接続中です。少し待ってからもう一度送ってください");
 }
-$("txt").addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.isComposing)sendMsg()});
+$("txt").addEventListener("keydown",e=>{if(e.key!=="Enter"||e.isComposing)return;if(P("enter",true)||e.ctrlKey||e.metaKey)sendMsg()});
 $("ap").addEventListener("keydown",e=>{if(e.key==="Enter")doAuth("login")});
 $("f").onchange=async()=>{
   const file=$("f").files[0];$("f").value="";if(!file||!S.chan)return;
@@ -2812,7 +2913,7 @@ function drawCall(){
   const users=S.calls[call.channel]||[],keep=new Set();
   users.forEach(u=>{
     const me=u.id===S.me.id,id="t"+u.id;keep.add(id);
-    const t=getTile(tiles,id,"",me);
+    const t=getTile(tiles,id,"",me);t.dataset.uid=u.id;
     if(!t.querySelector(".av"))t.insertBefore(avatar(u.name,"av cav"),t.querySelector(".nm"));
     t.classList.toggle("cam",!!u.cam);t.classList.toggle("off",!u.mic);
     t.classList.toggle("mirror",me&&(!coarse||call.facing==="user"));
@@ -2890,12 +2991,6 @@ function drawRing(){
 }
 
 /* ---------- フレンド / サーバー / ロール の操作 ---------- */
-async function addFriend(){
-  const f=await form("フレンドを追加",[{k:"code",label:"友達のフレンドコード"}],"追加する");
-  if(!f||!f.code)return;
-  const d=await T(()=>api("/api/friends/add","POST",{code:f.code}));
-  if(d)toast(d.name+" さんとフレンドになりました");
-}
 function addServerModal(){
   const tabs=el("div","tabs"),tc=el("button","on","サーバーを作成"),tj=el("button","","サーバーに参加");
   const c=el("div","fld"),j=el("div","fld");
@@ -2978,38 +3073,6 @@ async function openDm(name){
   const d=await T(()=>api("/api/dm","POST",{name}));
   if(d){await load();setView("dm",d.id)}
 }
-function settingsModal(){
-  const l1=el("label");l1.textContent="通知の対象";
-  const sel=el("select");
-  [["mention","メンション・返信・DMのみ"],["all","すべてのメッセージ"],["off","通知しない"]].forEach(([v,t])=>{const o=el("option");o.value=v;o.textContent=t;sel.append(o)});
-  sel.value=S.notify;
-  sel.onchange=()=>{S.notify=sel.value;T(()=>api("/api/settings","POST",{notify_mode:S.notify}))};
-  const st=()=>"Notification" in window?({granted:"許可済み",denied:"ブロック中 (ブラウザの設定で許可してください)",default:"未設定"})[Notification.permission]:"このブラウザは非対応です";
-  const ps=el("p","muted");ps.textContent="ブラウザ通知: "+st();
-  const bn=ibtn("bell","通知をオンにする",async()=>{await enableNotifications();ps.textContent="ブラウザ通知: "+st()},"btn");
-  const sl=el("label","chk"),sc=el("input");sc.type="checkbox";sc.checked=S.sound;
-  sc.onchange=()=>{S.sound=sc.checked;localStorage.sound=sc.checked?"1":"0"};sl.append(sc,"通知音を鳴らす");
-  const note=el("p","muted");
-  note.textContent=S.push?"Push通知が有効なので、アプリを閉じていても通知が届きます (iPhoneはホーム画面に追加してください)。":"サーバー側でPush通知が未設定のため、通知はこのアプリを開いている間だけ届きます。";
-  // テーマ
-  const tl=el("label");tl.textContent="テーマ";
-  const ts=el("select");
-  [["system","システムに合わせる"],["dark","ダーク"],["light","ライト"]].forEach(([v,t])=>{const o=el("option");o.value=v;o.textContent=t;ts.append(o)});
-  ts.value=localStorage.theme||"system";ts.onchange=()=>{localStorage.theme=ts.value;applyTheme()};
-  const cl=el("label");cl.textContent="テーマカラー (好きな色を選べます)";
-  const sw=el("div","swatches");
-  [["標準",""],["スカイ","#38b6ff"],["インディゴ","#6b7cff"],["パープル","#a855f7"],["ピンク","#ec4899"],["レッド","#ef4444"],["オレンジ","#f59e0b"],["グリーン","#22c55e"]].forEach(([n,c])=>{
-    const b=el("button","swt");b.title=n;b.style.background=c||"var(--grad)";
-    b.onclick=()=>{if(c)localStorage.accent=c;else localStorage.removeItem("accent");applyTheme()};sw.append(b);
-  });
-  const ci=el("input");ci.type="color";ci.value=localStorage.accent||"#6b7cff";ci.title="好きな色を選ぶ";
-  ci.oninput=()=>{localStorage.accent=ci.value;applyTheme()};
-  const pl=el("label","chk"),pc=el("input");pc.type="checkbox";pc.checked=localStorage.pop!=="0";
-  pc.onchange=()=>{localStorage.pop=pc.checked?"1":"0";applyTheme()};pl.append(pc,"文字をポップな太字にする");
-  const pr=ibtn("user","プロフィールを編集",()=>{closeModal();editProfileModal()},"ghost");
-  const lo=ibtn("logout","ログアウト",()=>{closeModal();logout()},"ghost");
-  modal("設定",[pr,tl,ts,cl,sw,ci,pl,l1,sel,ps,bn,sl,note,lo]);
-}
 function shiftHue(hex,d){
   const r=parseInt(hex.slice(1,3),16)/255,g=parseInt(hex.slice(3,5),16)/255,b=parseInt(hex.slice(5,7),16)/255;
   const mx=Math.max(r,g,b),mn=Math.min(r,g,b),l=(mx+mn)/2;let h=0,s=0;
@@ -3042,7 +3105,8 @@ async function editServerModal(s){
   const fi=el("input");fi.type="file";fi.accept="image/*";fi.hidden=true;
   fi.onchange=async()=>{
     const f=fi.files[0];fi.value="";if(!f)return;
-    const b=await squareBlob(f);
+    const b=await cropImage(f);
+    if(b===undefined)return;
     if(!b){toast("画像を読み込めませんでした");return}
     blob=b;remove=false;draw(URL.createObjectURL(b));
   };
@@ -3094,7 +3158,6 @@ function mediaEditor(kind,label,spec){
   const fi=el("input");fi.type="file";fi.accept="image/png,image/jpeg,image/gif,image/webp,video/mp4,video/webm";fi.hidden=true;
   fi.onchange=()=>{
     const f=fi.files[0];fi.value="";if(!f)return;
-    if(f.size>30*1024*1024){toast("30MBまでのファイルを選んでください");return}
     blob=f;remove=false;mime=f.type;url=URL.createObjectURL(f);draw();
   };
   const row=el("div","row");row.style.justifyContent="flex-start";
@@ -3131,7 +3194,8 @@ async function editProfileModal(){
   const fi=el("input");fi.type="file";fi.accept="image/*";fi.hidden=true;
   fi.onchange=async()=>{
     const f=fi.files[0];fi.value="";if(!f)return;
-    const b=await squareBlob(f);
+    const b=await cropImage(f);
+    if(b===undefined)return;
     if(!b){toast("画像を読み込めませんでした");return}
     blob=b;remove=false;draw(URL.createObjectURL(b));
   };
@@ -3141,7 +3205,7 @@ async function editProfileModal(){
   l1.textContent="名前 (ログインにも使います / 2〜20文字)";ni.value=S.me.name;ni.maxLength=20;w1.append(l1,ni);
   const w2=el("div","fld"),l2=el("label"),ta=el("textarea");
   l2.textContent="自己紹介 (200文字まで)";ta.value=p.bio;ta.maxLength=200;ta.placeholder="好きなことや、ひとことをどうぞ";w2.append(l2,ta);
-  const be=mediaEditor("banner","バナー (画像・動画 / 30MBまで)",p.banner),ge=mediaEditor("bg","プロフィールの背景 (画像・動画 / 30MBまで)",p.bg);
+  const be=mediaEditor("banner","バナー (画像・動画 / 容量無制限)",p.banner),ge=mediaEditor("bg","プロフィールの背景 (画像・動画 / 容量無制限)",p.bg);
   const go=el("button","btn","保存する");
   go.onclick=async()=>{
     try{
@@ -3157,6 +3221,453 @@ async function editProfileModal(){
   modal("プロフィールを編集",[prev,row,w1,w2,be.node,ge.node,go]);
 }
 
+
+/* ======================================================================
+   v5 追加機能: 設定の保存 / 戻るボタン / アイコン切り抜き / 発言リング / グループ / 設定画面
+   ====================================================================== */
+
+/* ---------- 端末ごとの設定 (localStorage.prefs) ---------- */
+function P(k,d){try{const o=JSON.parse(localStorage.prefs||"{}");return k in o?o[k]:d}catch(e){return d}}
+function setP(k,v){let o={};try{o=JSON.parse(localStorage.prefs||"{}")}catch(e){}o[k]=v;localStorage.prefs=JSON.stringify(o);applyPrefs()}
+function applyPrefs(){
+  const b=document.body;
+  b.classList.toggle("compact",!!P("compact",false));
+  b.classList.toggle("reduce",!!P("reduce",false));
+  b.classList.toggle("hc",!!P("contrast",false));
+  b.classList.toggle("big",!!P("big",false));
+  document.documentElement.style.setProperty("--mfs",(P("fs",100)/100*15)+"px");
+  AUDIO.noiseSuppression=!!P("ns",false);
+  AUDIO.echoCancellation=P("ec",true)!==false;
+  AUDIO.autoGainControl=!!P("agc",false);
+  const id=P("micId","");if(id)AUDIO.deviceId={ideal:id};else delete AUDIO.deviceId;
+}
+
+/* ---------- 戻るボタン対応 (画面を1つずつ戻る / スマホは一覧→アプリを抜ける) ---------- */
+const UIS=[];let uiN=0,pendingBack=0,deferred=[];
+const MOB=()=>matchMedia("(max-width:820px)").matches;
+function uiOpen(close){const id=++uiN;UIS.push({id,close});if(pendingBack)deferred.push(id);else history.pushState({ui:id},"");return id}
+function uiClosed(id){
+  const i=UIS.findIndex(x=>x.id===id);if(i<0)return;
+  const top=i===UIS.length-1;UIS.splice(i,1);
+  const di=deferred.indexOf(id);if(di>=0){deferred.splice(di,1);return}
+  if(top){pendingBack++;history.back()}
+}
+const atGuard=()=>!!(history.state&&history.state.g===0);
+function fixGuard(){if(MOB()&&S.me&&atGuard())history.pushState({g:1},"")}
+addEventListener("popstate",()=>{
+  if(pendingBack){pendingBack--;if(!pendingBack){fixGuard();deferred.splice(0).forEach(id=>history.pushState({ui:id},""))}return}
+  const t=UIS.pop();
+  if(t){t.close();fixGuard();return}
+  if(MOB()&&S.me&&atGuard()){
+    if(S.chan&&!$("nav").classList.contains("open"))openNav();
+    else history.back();
+  }
+});
+function initHistory(){if(MOB()&&!(history.state&&history.state.g!=null)){history.replaceState({g:0},"");history.pushState({g:1},"")}}
+
+let modalUi=0,navUi=0,memUi=0,lbUi=0,setUi=0;
+function closeModal(fromPop){
+  const f=modalCancel;modalCancel=null;$("modal").hidden=true;$("mbox").innerHTML="";
+  const id=modalUi;modalUi=0;if(id&&fromPop!==true)uiClosed(id);
+  if(f)f();
+}
+function modal(title,nodes,onCancel){
+  const had=modalUi;modalUi=0;
+  const f0=modalCancel;modalCancel=null;$("mbox").innerHTML="";if(f0)f0();
+  const b=$("mbox"),h=el("div","mh"),t=el("b");t.textContent=title;
+  h.append(t,ibtn("x","",closeModal,"ghost sq","閉じる"));
+  b.append(h,...nodes);modalCancel=onCancel||null;$("modal").hidden=false;
+  modalUi=had||uiOpen(()=>closeModal(true));
+  const i=b.querySelector("input:not([type=checkbox])");if(i&&!coarse)setTimeout(()=>i.focus(),60);
+}
+function _scrimOff(){if(!$("nav").classList.contains("open")&&!$("members").classList.contains("open"))$("scrim").hidden=true}
+function openNav(){$("nav").classList.add("open");$("scrim").hidden=false;if(!navUi)navUi=uiOpen(()=>{navUi=0;$("nav").classList.remove("open");_scrimOff()})}
+function openMem(){$("members").classList.add("open");$("scrim").hidden=false;if(!memUi)memUi=uiOpen(()=>{memUi=0;$("members").classList.remove("open");_scrimOff()})}
+function closeDrawers(){
+  const a=navUi,b=memUi;navUi=memUi=0;
+  $("nav").classList.remove("open");$("members").classList.remove("open");$("scrim").hidden=true;
+  [b,a].forEach(i=>{if(i)uiClosed(i)});
+}
+{
+  const _c=closeLightbox,_o=openLightbox;
+  closeLightbox=function(fromPop){_c();const id=lbUi;lbUi=0;if(id&&fromPop!==true)uiClosed(id)};
+  openLightbox=function(m,url){_o(m,url);if(!lbUi)lbUi=uiOpen(()=>{lbUi=0;_c()})};
+}
+
+/* ---------- アイコンを写す範囲を選ぶ (ドラッグで移動 / スライダーで拡大) ---------- */
+function cropImage(file,size=256){
+  return new Promise(async res=>{
+    let bmp;
+    try{bmp=await createImageBitmap(file)}catch(e){res(null);return}
+    const V=Math.max(200,Math.min(300,innerWidth-70));
+    const ov=el("div","crop"),box=el("div","cropbox"),h=el("b");h.textContent="アイコンに写す範囲を選ぶ";
+    const hint=el("small","muted");hint.textContent="ドラッグで動かして、スライダーで大きさを変えられます";
+    const stage=el("div","cropstage");stage.style.width=stage.style.height=V+"px";
+    const cv=el("canvas");cv.width=cv.height=V;const g=cv.getContext("2d");
+    stage.append(cv,el("div","cropmask"));
+    let zoom=1,ox=0,oy=0;const base=V/Math.min(bmp.width,bmp.height);
+    const clamp=()=>{const mx=(bmp.width*base*zoom-V)/2,my=(bmp.height*base*zoom-V)/2;ox=Math.max(-mx,Math.min(mx,ox));oy=Math.max(-my,Math.min(my,oy))};
+    const draw=(ctx,k)=>{const w=bmp.width*base*zoom*k,hh=bmp.height*base*zoom*k;ctx.clearRect(0,0,V*k,V*k);ctx.drawImage(bmp,V*k/2-w/2+ox*k,V*k/2-hh/2+oy*k,w,hh)};
+    const sl=el("input");sl.type="range";sl.min=100;sl.max=400;sl.value=100;
+    sl.oninput=()=>{zoom=sl.value/100;clamp();draw(g,1)};
+    let drag=null;
+    stage.onpointerdown=e=>{drag={x:e.clientX,y:e.clientY};stage.setPointerCapture(e.pointerId)};
+    stage.onpointermove=e=>{if(!drag)return;ox+=e.clientX-drag.x;oy+=e.clientY-drag.y;drag={x:e.clientX,y:e.clientY};clamp();draw(g,1)};
+    stage.onpointerup=stage.onpointercancel=()=>{drag=null};
+    stage.onwheel=e=>{e.preventDefault();sl.value=Math.max(100,Math.min(400,Number(sl.value)-e.deltaY/4));sl.oninput()};
+    let id=0,done=false;
+    const finish=v=>{if(done)return;done=true;ov.remove();const i=id;id=0;if(i)uiClosed(i);res(v)};
+    const ok=el("button","btn","これにする"),no=el("button","ghost","やめる");
+    no.onclick=()=>finish(undefined);
+    ok.onclick=()=>{const o=document.createElement("canvas");o.width=o.height=size;draw(o.getContext("2d"),size/V);o.toBlob(b=>finish(b||null),"image/webp",.92)};
+    const row=el("div","row");row.style.justifyContent="center";row.append(no,ok);
+    box.append(h,hint,stage,sl,row);ov.append(box);document.body.append(ov);
+    clamp();draw(g,1);
+    id=uiOpen(()=>{id=0;finish(undefined)});
+  });
+}
+
+/* ---------- 話している人のアイコンに緑のリング ---------- */
+const SPK={ctx:null,an:{},on:{}};
+function spkNode(key,stream){
+  const tr=stream&&stream.getAudioTracks()[0];if(!tr)return null;
+  let a=SPK.an[key];if(a&&a.tid===tr.id)return a;
+  if(a){try{a.src.disconnect()}catch(e){}}
+  try{
+    if(!SPK.ctx)SPK.ctx=new (window.AudioContext||window.webkitAudioContext)();
+    const src=SPK.ctx.createMediaStreamSource(new MediaStream([tr])),an=SPK.ctx.createAnalyser();
+    an.fftSize=512;src.connect(an);
+    return SPK.an[key]={tid:tr.id,src,an,buf:new Uint8Array(an.fftSize),hold:0};
+  }catch(e){return null}
+}
+function spkPaint(){
+  document.querySelectorAll("[data-uid]").forEach(n=>n.classList.toggle("speaking",!!SPK.on[n.dataset.uid]));
+}
+function spkTick(){
+  if(!call){if(Object.keys(SPK.on).length){SPK.on={};SPK.an={};spkPaint()}return}
+  if(SPK.ctx&&SPK.ctx.state==="suspended")SPK.ctx.resume().catch(()=>{});
+  const thr=P("spk",5)/100,now=performance.now();let ch=false;
+  for(const u of (S.calls[call.channel]||[])){
+    const me=u.id===S.me.id;
+    const stream=me?(call.atrack&&call.mic?call.stream:null):(call.peers[u.id]?call.peers[u.id].stream:null);
+    const a=u.mic&&stream?spkNode(u.id,stream):null;
+    let on=false;
+    if(a){
+      a.an.getByteTimeDomainData(a.buf);let s=0;
+      for(let i=0;i<a.buf.length;i++){const v=(a.buf[i]-128)/128;s+=v*v}
+      if(Math.sqrt(s/a.buf.length)>thr)a.hold=now+350;
+      on=now<a.hold;
+    }
+    if(!!SPK.on[u.id]!==on){SPK.on[u.id]=on;ch=true}
+  }
+  if(ch)spkPaint();
+}
+setInterval(spkTick,100);
+
+/* ---------- グループ ---------- */
+function groupAv(cls){const a=el("div",(cls||"av xs")+" gav");a.innerHTML=ic("users",cls&&cls.includes("sm2")?17:13);return a}
+function friendChecks(exclude){
+  const wrap=el("div","fpick"),sel=new Set();
+  const list=S.friends.filter(f=>!exclude.includes(f.name));
+  if(!list.length){const p=el("p","muted");p.textContent="追加できるフレンドがいません。先に「フレンド追加」でフレンドを追加してください。";wrap.append(p)}
+  list.forEach(f=>{
+    const r=el("label","fprow"),c=el("input");c.type="checkbox";
+    c.onchange=()=>{c.checked?sel.add(f.name):sel.delete(f.name)};
+    r.append(c,avatar(f.name,"av xs"),document.createTextNode(f.name));wrap.append(r);
+  });
+  return {node:wrap,sel};
+}
+function newGroupModal(){
+  const w=el("div","fld"),l=el("label"),ni=el("input");
+  l.textContent="グループ名";ni.maxLength=30;ni.placeholder="例: なかよしグループ";w.append(l,ni);
+  const l2=el("div","muted");l2.textContent="メンバーにするフレンドを選ぶ";
+  const fc=friendChecks([]);
+  const go=el("button","btn","グループを作る");
+  go.onclick=async()=>{
+    const name=ni.value.trim();if(!name){toast("グループ名を入れてください");return}
+    const d=await T(()=>api("/api/groups","POST",{name,members:[...fc.sel]}));if(!d)return;
+    closeModal();await load();S.homeTab="g";setView("dm",d.id);
+  };
+  modal("グループを作る",[w,l2,fc.node,go]);
+}
+function newDmModal(){
+  if(!S.friends.length){toast("先に「フレンド追加」でフレンドを追加してください");return}
+  const rows=S.friends.map(f=>{
+    const r=el("div","frow"+(f.online?"":" off")),n=el("span","fn");n.textContent=f.name;
+    r.append(statusAvatar(f.name,"av",f.online),n);r.onclick=()=>{closeModal();S.homeTab="d";openDm(f.name)};return r;
+  });
+  modal("DMを送る相手を選ぶ",rows);
+}
+function addGroupMembers(c){
+  const fc=friendChecks(c.members.map(m=>m.name));
+  const go=el("button","btn","追加する");
+  go.onclick=async()=>{
+    if(!fc.sel.size){toast("追加するフレンドを選んでください");return}
+    const d=await T(()=>api(`/api/groups/${c.id}/add`,"POST",{names:[...fc.sel]}));
+    if(d){closeModal();toast(d.added+"人を追加しました");await load()}
+  };
+  modal("メンバーを追加",[fc.node,go]);
+}
+function renameGroup(c){
+  const w=el("div","fld"),l=el("label"),ni=el("input");l.textContent="グループ名";ni.value=c.name;ni.maxLength=30;w.append(l,ni);
+  const go=el("button","btn","変更する");
+  go.onclick=async()=>{if(await T(()=>api(`/api/groups/${c.id}/rename`,"POST",{name:ni.value.trim()}))){closeModal();await load();if(S.chan===c.id)openChan(c.id,true)}};
+  modal("グループ名を変更",[w,go]);
+}
+async function leaveGroup(c){
+  if(!await confirmBox(`「${c.name}」から抜けますか？`,"抜ける"))return;
+  if(call&&call.channel===c.id)await leaveCall();
+  if(await T(()=>api(`/api/groups/${c.id}/leave`,"POST"))){await load();setView("dm")}
+}
+function groupMenu(c){
+  const lb=el("div","muted");lb.textContent="メンバー "+c.members.length+"人";
+  const mem=c.members.map(m=>{
+    const e=el("div","frow"),n=el("span","fn");n.textContent=m.name+(m.name===S.me.name?" (あなた)":"");
+    e.append(statusAvatar(m.name,"av sm2",m.online),n);e.onclick=()=>{closeModal();profileModal(m.name)};return e;
+  });
+  modal(c.name,[lb,...mem,mitem("userplus","メンバーを追加",()=>addGroupMembers(c)),mitem("pencil","グループ名を変更",()=>renameGroup(c)),mitem("logout","グループを抜ける",()=>leaveGroup(c))]);
+}
+function headProfile(){const c=S.dms.find(x=>x.id===S.chan);if(!c)return;if(c.group)groupMenu(c);else profileModal(c.name)}
+async function addFriend(){
+  const f=await form("フレンドを追加",[{k:"code",label:"友達のフレンドコード"}],"追加する");
+  if(!f||!f.code)return;
+  const d=await T(()=>api("/api/friends/add","POST",{code:f.code}));
+  if(d){toast(d.name+" さんとフレンドになりました");S.homeTab="d";openDm(d.name)}
+}
+
+function drawList(){
+  const h=$("sidehead"),l=$("list");h.innerHTML="";l.innerHTML="";
+  const badge=n=>{const b=el("span","badge");b.textContent=n;return b};
+  const hint=t=>{const p=el("p","muted");p.textContent=t;l.append(p)};
+  const chanRows=list=>list.forEach(c=>{
+    const wrap=el("div");
+    const d=el("div","ch"+(c.id===S.chan?" active":"")+(S.unread[c.id]?" unread":""));
+    const lead=S.view==="dm"?(c.group?groupAv("av xs"):statusAvatar(c.name,"av xs",c.online)):ico(c.kind==="voice"?"speaker":"hash",18);
+    const n=el("span","cn");n.textContent=c.name;d.append(lead,n);
+    const cu=S.calls[c.id]||[];
+    if(S.view==="dm"&&cu.length)d.append(ico("phone",15));
+    if(S.ment[c.id])d.append(badge(S.ment[c.id]));
+    if(S.view==="dm"&&!c.group)d.append(ibtn("more","",e=>{e.stopPropagation();friendMenu({id:c.uid,name:c.name})},"xb","メニュー"));
+    if(c.group)d.append(ibtn("more","",e=>{e.stopPropagation();groupMenu(c)},"xb","グループ設定"));
+    d.onclick=()=>openChan(c.id);wrap.append(d);
+    if(c.kind==="voice")cu.forEach(u=>{
+      const v=el("div","vu");v.dataset.uid=u.id;v.append(avatar(u.name,"av xs"));if(!u.mic)v.append(ico("micoff",13));
+      const nn=el("span");nn.textContent=u.name;v.append(nn);wrap.append(v);
+    });
+    l.append(wrap);
+  });
+  if(S.view==="dm"){
+    const t=el("span","t");t.textContent="ホーム";h.append(t);
+    if(S.homeTab!=="g")S.homeTab="d";
+    const acts=el("div","homeact");
+    const ab=el("button","addbar sm",ic("userplus",15)+"<span>フレンド追加</span>");ab.onclick=addFriend;
+    const nb=el("button","addbar sm",S.homeTab==="g"?ic("plus",15)+"<span>グループ作成</span>":ic("send",15)+"<span>新しいDM</span>");
+    nb.onclick=S.homeTab==="g"?newGroupModal:newDmModal;
+    acts.append(ab,nb);l.append(acts);
+    const seg=el("div","seg");
+    [["d","DM"],["g","グループ"]].forEach(([k,tx])=>{const b=el("button",S.homeTab===k?"on":"");b.textContent=tx;b.onclick=()=>{S.homeTab=k;drawList()};seg.append(b)});
+    l.append(seg);
+    const dms=S.dms.filter(c=>!c.group),gs=S.dms.filter(c=>c.group);
+    if(S.homeTab==="g"){
+      if(!gs.length)hint("まだグループがありません。「グループ作成」でフレンドを集めましょう。");
+      chanRows(gs);
+    }else{
+      if(!dms.length)hint("DMはまだありません。「新しいDM」からフレンドにメッセージを送れます。");
+      chanRows(dms);
+    }
+  }else{
+    const s=curServer();if(!s)return;
+    const t=el("span","t");t.textContent=s.name;h.append(t,ibtn("gear","",serverMenu,"ghost sq","サーバー設定"));
+    chanRows(s.channels);
+  }
+  updateAnnBtn();updateTitle();
+}
+async function drawMembers(){
+  const p=$("members");p.innerHTML="";
+  if(S.view==="dm"){
+    const c=S.dms.find(x=>x.id===S.chan);
+    if(c&&c.group){
+      const h=el("h4");h.textContent="メンバー  "+c.members.length;p.append(h);
+      c.members.forEach(m=>{
+        const e=el("div","mem"+(m.online?"":" off"));e.dataset.uid=m.id;e.append(statusAvatar(m.name,"av sm2",m.online));
+        const i=el("div","mi"),n=el("span");n.textContent=m.name+(m.name===S.me.name?" (あなた)":"");i.append(n);e.append(i);
+        e.onclick=()=>{closeDrawers();profileModal(m.name)};p.append(e);
+      });
+      p.append(ibtn("userplus","メンバーを追加",()=>addGroupMembers(c),"ghost"));
+      return;
+    }
+    const h=el("h4");h.textContent="あなたのフレンドコード";p.append(h);
+    const cd=el("div","code");cd.textContent=S.code;p.append(cd);
+    const row=el("div","row");row.style.justifyContent="flex-start";
+    row.append(ibtn("copy","コピー",()=>copyText(S.code),"ghost"),ibtn("gear","再発行",async()=>{if(await confirmBox("古いコードは使えなくなります。再発行しますか？","再発行"))T(()=>api("/api/friends/newcode","POST"))},"ghost"));
+    p.append(row);
+    const t=el("p","muted");t.textContent="このコードを友達に送ると、友達が「フレンド追加」に入力してフレンドになれます。";p.append(t);
+    return;
+  }
+  const sid=S.view;let d;
+  try{d=await api(`/api/servers/${sid}/members`)}catch(e){return}
+  if(sid!==S.view)return;
+  const h=el("h4");h.textContent="メンバー  "+d.members.length;p.append(h);
+  d.members.forEach(m=>{
+    const e=el("div","mem"+(m.online?"":" off"));e.append(statusAvatar(m.name,"av sm2",m.online));
+    const i=el("div","mi"),n=el("span");n.textContent=m.name;
+    if(m.owner)n.append(el("span","tag","オーナー"));
+    i.append(n);
+    if(m.roles.length){const r=el("small");r.textContent=m.roles.join(", ");i.append(r)}
+    e.append(i);
+    e.onclick=()=>{closeDrawers();profileModal(m.name)};
+    p.append(e);
+  });
+}
+async function openChan(cid,auto){
+  S.chan=cid;S.unread[cid]=0;S.ment[cid]=0;last=null;clearReply();
+  if(!auto)closeDrawers();
+  drawList();
+  const isA=cid===S.announce;
+  const c=isA?{name:"公式アナウンス",kind:"announce"}:chanList().find(x=>x.id===cid);
+  const ht=$("headt");ht.innerHTML="";
+  if(c){
+    const lead=(isA||c.kind==="voice")?ico("speaker",19):(S.view==="dm"?(c.group?groupAv("av xs"):statusAvatar(c.name,"av xs",c.online)):ico("hash",19));
+    const nm=el("span");nm.textContent=c.name;ht.append(lead,nm);
+    if(c.group){const k=el("small","muted");k.textContent=c.members.length+"人";ht.append(k)}
+  }
+  $("profbtn").hidden=!(c&&S.view==="dm"&&!isA);
+  $("profbtn").innerHTML=ic(c&&c.group?"gear":"user",20);$("profbtn").title=c&&c.group?"グループ設定":"プロフィール";
+  $("sq").placeholder=(c?c.name:"")+"を検索";
+  const ro=isA&&!S.owner;$("bar").hidden=ro;$("ronote").hidden=!ro;$("stampbox").hidden=true;
+  updateCallBtn();
+  if(S.view==="dm")drawMembers();
+  $("msgs").innerHTML="";
+  const d=await T(()=>api(`/api/channels/${cid}/messages`));
+  if(!d||S.chan!==cid)return;
+  d.messages.forEach(addMsg);$("msgs").scrollTop=1e9;
+}
+
+/* ---------- 設定画面 (ディスコード風) ---------- */
+const sRow=(title,desc,ctl)=>{
+  const r=el("div","srow"),t=el("div","st"),b=el("b");b.textContent=title;t.append(b);
+  if(desc){const s=el("small");s.textContent=desc;t.append(s)}
+  r.append(t);if(ctl)r.append(ctl);return r;
+};
+const sHead=t=>{const h=el("h3","sh3");h.textContent=t;return h};
+const sNote=(t,cls)=>{const n=el("div","snote "+(cls||""));n.textContent=t;return n};
+function sSwitch(val,fn){const l=el("label","sw"),i=el("input");i.type="checkbox";i.checked=!!val;i.onchange=()=>fn(i.checked);l.append(i,el("span","knob"));return l}
+function sSelect(opts,val,fn){const s=el("select");opts.forEach(([v,t])=>{const o=el("option");o.value=v;o.textContent=t;s.append(o)});s.value=val;s.onchange=()=>fn(s.value);return s}
+function sRange(min,max,step,val,fn,fmt){
+  const w=el("div","srange"),i=el("input"),o=el("span","muted");
+  i.type="range";i.min=min;i.max=max;i.step=step;i.value=val;o.textContent=fmt(val);
+  i.oninput=()=>{o.textContent=fmt(i.value);fn(Number(i.value))};w.append(i,o);return w;
+}
+const SET_CATS=[["acct","user","マイアカウント"],["prof","pencil","プロフィール"],["appear","globe","外観"],["chat","send","チャット"],
+  ["notif","bell","通知"],["voice","mic","音声・ビデオ"],["access","zoomin","アクセシビリティ"],["data","shield","データ・保存"],["about","gear","アプリについて"]];
+function closeSettings(fromPop){
+  const o=$("settings");if(o)o.remove();
+  const id=setUi;setUi=0;if(id&&fromPop!==true)uiClosed(id);
+}
+function settingsModal(page){
+  if($("settings"))closeSettings(true);
+  const ov=el("div","set");ov.id="settings";ov.dataset.view="list";
+  const nav=el("div","setnav"),body=el("div","setbody"),top=el("div","settop"),inner=el("div","setin");
+  const ttl=el("div","setttl");ttl.textContent="設定";
+  nav.append(ttl,ibtn("x","",closeSettings,"ghost sq mo setx","閉じる"));
+  const back=ibtn("chev","",()=>{ov.dataset.view="list"},"ghost sq mo setback","戻る");
+  const ct=el("b","setct");
+  top.append(back,ct,ibtn("x","",closeSettings,"ghost sq","閉じる"));
+  body.append(top,inner);
+  const items={};
+  const PAGES={
+    acct(c){
+      const card=el("div","pcard"),i=el("div","pci"),n=el("b");n.textContent=S.me.name;
+      const s=el("small");s.textContent="フレンドコード: "+S.code;i.append(n,s);card.append(avatar(S.me.name,"av lg"),i);c.append(card);
+      c.append(sRow("プロフィールを編集","名前・自己紹介・アイコン・バナーを変更",ibtn("pencil","編集",()=>{closeSettings();editProfileModal()},"btn")));
+      c.append(sRow("フレンドコード",S.code,ibtn("copy","コピー",()=>copyText(S.code),"ghost")));
+      c.append(sRow("フレンドコードを再発行","古いコードは使えなくなります",ibtn("gear","再発行",async()=>{
+        if(await confirmBox("古いコードは使えなくなります。再発行しますか？","再発行"))T(async()=>{await api("/api/friends/newcode","POST");await load();show("acct")});
+      },"ghost")));
+      c.append(sRow("ログアウト","この端末からログアウトします",ibtn("logout","ログアウト",()=>{closeSettings();logout()},"danger")));
+    },
+    prof(c){
+      c.append(sNote("アイコンは画像を選んだあと、写したい場所を動かして決められます。バナーとプロフィール背景は画像も動画も容量無制限です。"));
+      c.append(sRow("プロフィールを編集","アイコン / 名前 / 自己紹介 / バナー / 背景",ibtn("pencil","編集する",()=>{closeSettings();editProfileModal()},"btn")));
+      c.append(sRow("自分のプロフィールを見る","みんなに見える表示を確認",ibtn("user","見る",()=>{closeSettings();profileModal(S.me.name)},"ghost")));
+    },
+    appear(c){
+      c.append(sHead("テーマ"));
+      c.append(sRow("テーマ","明るさを選びます",sSelect([["system","システムに合わせる"],["dark","ダーク"],["light","ライト"]],localStorage.theme||"system",v=>{localStorage.theme=v;applyTheme()})));
+      const sw=el("div","swatches");
+      [["標準",""],["スカイ","#38b6ff"],["インディゴ","#6b7cff"],["パープル","#a855f7"],["ピンク","#ec4899"],["レッド","#ef4444"],["オレンジ","#f59e0b"],["グリーン","#22c55e"]].forEach(([nm,col])=>{
+        const b=el("button","swt");b.title=nm;b.style.background=col||"var(--grad)";
+        b.onclick=()=>{if(col)localStorage.accent=col;else localStorage.removeItem("accent");applyTheme()};sw.append(b);
+      });
+      const ci=el("input");ci.type="color";ci.value=localStorage.accent||"#6b7cff";ci.title="好きな色を選ぶ";
+      ci.oninput=()=>{localStorage.accent=ci.value;applyTheme()};sw.append(ci);
+      c.append(sRow("テーマカラー","好きな色を選べます",null));c.append(sw);
+      c.append(sRow("文字をポップな太字にする","名前などを丸ゴシックで目立たせます",sSwitch(localStorage.pop!=="0",v=>{localStorage.pop=v?"1":"0";applyTheme()})));
+    },
+    chat(c){
+      c.append(sHead("メッセージ"));
+      c.append(sRow("Enterキーで送信","オフにすると Ctrl + Enter で送信します",sSwitch(P("enter",true),v=>setP("enter",v))));
+      c.append(sRow("メッセージの文字サイズ","チャットの文字の大きさ",sRange(80,150,5,P("fs",100),v=>setP("fs",v),v=>v+"%")));
+      c.append(sRow("コンパクト表示","メッセージの間隔をつめます",sSwitch(P("compact",false),v=>setP("compact",v))));
+    },
+    notif(c){
+      c.append(sRow("通知の対象","どのメッセージで通知するか",sSelect([["mention","メンション・返信・DMのみ"],["all","すべてのメッセージ"],["off","通知しない"]],S.notify,v=>{S.notify=v;T(()=>api("/api/settings","POST",{notify_mode:v}))})));
+      const st=()=>"Notification" in window?({granted:"許可済み",denied:"ブロック中 (ブラウザの設定で許可してください)",default:"未設定"})[Notification.permission]:"このブラウザは非対応です";
+      const desc=sRow("ブラウザ通知","状態: "+st(),ibtn("bell","オンにする",async()=>{await enableNotifications();desc.querySelector("small").textContent="状態: "+st()},"btn"));
+      c.append(desc);
+      c.append(sRow("通知音を鳴らす","新しいメッセージが届いたとき",sSwitch(S.sound,v=>{S.sound=v;localStorage.sound=v?"1":"0"})));
+      c.append(sNote(S.push?"Push通知が有効なので、アプリを閉じていても通知が届きます (iPhoneはホーム画面に追加してください)。":"サーバー側でPush通知が未設定のため、通知はこのアプリを開いている間だけ届きます。"));
+    },
+    voice(c){
+      c.append(sHead("入力"));
+      const sel=el("select"),o0=el("option");o0.value="";o0.textContent="既定のマイク";sel.append(o0);
+      if(navigator.mediaDevices&&navigator.mediaDevices.enumerateDevices)navigator.mediaDevices.enumerateDevices().then(ds=>{
+        ds.filter(d=>d.kind==="audioinput"&&d.deviceId).forEach((d,i)=>{const o=el("option");o.value=d.deviceId;o.textContent=d.label||"マイク "+(i+1);sel.append(o)});
+        sel.value=P("micId","");
+      }).catch(()=>{});
+      sel.onchange=()=>setP("micId",sel.value);
+      c.append(sRow("マイク","次に通話へ入るときから反映されます",sel));
+      c.append(sRow("発言の検出感度","小さいほど小さな声でも緑のリングが出ます",sRange(1,25,1,P("spk",5),v=>setP("spk",v),v=>String(v))));
+      c.append(sHead("音声処理 (次の通話から)"));
+      c.append(sRow("エコーを消す","スピーカーの音がマイクに入るのを防ぎます",sSwitch(P("ec",true),v=>setP("ec",v))));
+      c.append(sRow("ノイズを抑える","キーボード音などを小さくします",sSwitch(P("ns",false),v=>setP("ns",v))));
+      c.append(sRow("音量を自動で調整","声の大きさを自動でそろえます",sSwitch(P("agc",false),v=>setP("agc",v))));
+      c.append(sNote("カメラ・画面共有・インカメラとアウトカメラの切り替えは、通話中のボタンから行えます。"));
+    },
+    access(c){
+      c.append(sRow("アニメーションを減らす","動きや光る演出を止めます",sSwitch(P("reduce",false),v=>setP("reduce",v))));
+      c.append(sRow("コントラストを強める","薄い文字を見やすくします",sSwitch(P("contrast",false),v=>setP("contrast",v))));
+      c.append(sRow("ボタンを大きくする","タップしやすくします",sSwitch(P("big",false),v=>setP("big",v))));
+    },
+    data(c){
+      c.append(sNote(S.persistent?"外部データベースに保存中です。アプリを更新(再デプロイ)しても、アカウント・メッセージ・アイコン・バナーは消えません。":"データがこのサーバーのディスクだけに保存されています。Renderなどで更新すると消えてしまうので、環境変数 DATABASE_URL に外部データベース(Neonなど)の接続URLを設定してください。",S.persistent?"ok":"warn"));
+      c.append(sRow("この端末の設定をリセット","テーマ・文字サイズ・音声設定などを初期化します (アカウントは消えません)",ibtn("trash","リセット",async()=>{
+        if(!await confirmBox("この端末の表示・音声設定を初期化しますか？","リセット"))return;
+        ["prefs","theme","accent","pop","recent"].forEach(k=>localStorage.removeItem(k));applyTheme();applyPrefs();show("data");toast("設定をリセットしました");
+      },"ghost")));
+      c.append(sRow("アプリを再読み込み","表示がおかしいときに",ibtn("compress","再読み込み",()=>location.reload(),"ghost")));
+    },
+    about(c){
+      c.append(sRow("Motto","バージョン 5",null));
+      c.append(sRow("ホーム画面に追加","スマホではブラウザのメニューから「ホーム画面に追加」するとアプリのように使えます",null));
+      c.append(sRow("キーボード","Enter: 送信 / Esc: 閉じる",null));
+    }
+  };
+  function show(key){
+    Object.entries(items).forEach(([k,b])=>b.classList.toggle("on",k===key));
+    ov.dataset.view="detail";ov.dataset.page=key;
+    ct.textContent=SET_CATS.find(x=>x[0]===key)[2];
+    inner.innerHTML="";PAGES[key](inner);body.scrollTop=0;
+  }
+  SET_CATS.forEach(([k,icn,t])=>{const b=el("button","sitem",ic(icn,18)+`<span>${t}</span>`);b.onclick=()=>show(k);items[k]=b;nav.append(b)});
+  nav.append(el("div","ssp"),ibtn("logout","ログアウト",()=>{closeSettings();logout()},"sitem dng"));
+  ov.append(nav,body);document.body.append(ov);
+  setUi=uiOpen(()=>{setUi=0;closeSettings(true)});
+  if(!MOB()||page)show(page||"acct");
+}
+document.addEventListener("keydown",e=>{if(e.key==="Escape"&&$("settings")&&$("modal").hidden&&!$("lb"))closeSettings()});
+
+applyPrefs();
 applyTheme();
 initIcons();
 if(S.token)boot();
