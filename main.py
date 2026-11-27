@@ -1282,6 +1282,17 @@ async def get_messages(cid: int, u=Depends(current_user)):
     return {"messages": [row_to_msg(r, rx[r[0]], reps.get(r[10]) if r[10] else None) for r in rows]}
 
 
+@app.get("/api/channels/{cid}/search")
+async def search_messages(cid: int, q: str = "", u=Depends(current_user)):
+    require(u["id"], cid)
+    q = q.strip()[:100]
+    if not q:
+        return {"messages": []}
+    like = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+    rows = db.execute(MSG_SQL + "where m.channel_id=? and m.text like ? escape '\\' order by m.id desc limit 50", (cid, like)).fetchall()
+    return {"messages": [row_to_msg(r) for r in rows]}
+
+
 @app.post("/api/messages/{mid}/edit")
 async def edit_message(mid: int, b: dict, u=Depends(current_user)):
     r = db.execute("select channel_id,user_id,stamp_id from messages where id=?", (mid,)).fetchone()
@@ -1525,7 +1536,7 @@ PAGE = r"""<!doctype html><meta charset=utf-8>
 <style>
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 [hidden]{display:none!important}
-:root{--bg:#0e0f14;--bg2:#14151c;--bg3:#1a1b24;--bg4:#252633;--line:#2a2c3b;--tx:#eceef7;--tx2:#9a9eb6;--hi:#fff;--hov:#ffffff0d;--hov2:#ffffff16;--shadow:#0008;
+:root{--bg:#050507;--bg2:#0c0c0f;--bg3:#101014;--bg4:#1b1b21;--line:#202028;--tx:#eceef7;--tx2:#9a9eb6;--hi:#fff;--hov:#ffffff0d;--hov2:#ffffff16;--shadow:#0008;
  --acc:#6b7cff;--acc2:#e86bc3;--grad:linear-gradient(135deg,var(--acc),var(--acc2));--ok:#2fd27a;--bad:#ff5a6a;--rad:14px;
  --sat:env(safe-area-inset-top,0px);--sab:env(safe-area-inset-bottom,0px)}
 :root[data-theme=light]{--bg:#eceef7;--bg2:#ffffff;--bg3:#f5f6fc;--bg4:#e4e7f3;--line:#dadef0;--tx:#1b1d2b;--tx2:#656b86;--hi:#10111a;--hov:#0000000a;--hov2:#00000012;--shadow:#3a3f6a22}
@@ -1777,6 +1788,15 @@ body.pop .annt{color:#ff9500}
 #call.big .av.cav{width:128px;height:128px;font-size:52px;margin-bottom:22px}
 #call.big .tile:not(.cam):not(.screen) .nm{font-size:15px;bottom:14px}
 @media(max-width:820px){.tile{width:120px;height:116px}.tile.cam{width:46vw;height:130px}.av.cav{width:68px;height:68px;font-size:28px}#call.big .av.cav{width:96px;height:96px;font-size:40px}}
+
+/* ---- ヘッダー ---- */
+#head{background:var(--bg);border-bottom:1px solid var(--line)}
+#headt{font-size:15px;gap:10px}
+#head .ghost{background:transparent;color:var(--tx2)}#head .ghost:hover{color:var(--hi);background:var(--hov2)}
+#srch{position:relative;display:flex;align-items:center}
+#srch input{width:210px;padding:8px 38px 8px 12px;border-radius:10px;background:var(--bg3);font-size:14px}
+#srch #sqb{position:absolute;right:2px;padding:6px}
+@media(max-width:820px){#srch input{display:none}#srch #sqb{position:static}}
 </style>
 
 <div id=auth>
@@ -1806,6 +1826,8 @@ body.pop .annt{color:#ff9500}
    <button id=navbtn class="ghost sq mo" onclick="openNav()"></button>
    <div id=headt></div>
    <button id=callbtn onclick="callBtn()" hidden></button>
+   <button id=profbtn class="ghost sq" onclick="headProfile()" hidden></button>
+   <div id=srch><input id=sq type=search autocomplete=off><button id=sqb class="ghost sq" onclick="doSearch(true)"></button></div>
    <button id=membtn class="ghost sq mo" onclick="openMem()"></button>
   </div>
   <div id=nbar hidden></div>
@@ -1999,7 +2021,7 @@ function initIcons(){
   $("bemoji").innerHTML=ic("smile",21);$("bemoji").title="絵文字";
   $("bsend").innerHTML=ic("send",18)+'<span class="lbl">送信</span>';$("bsend").title="送信";
   $("hangb").innerHTML=ic("hangup",22);$("hangb").title="通話を終了";$("micc").innerHTML=ic("chev",14);$("micc").title="マイクを選ぶ";$("camc").innerHTML=ic("chev",14);$("camc").title="カメラを選ぶ";
-  $("navbtn").title="メニュー";$("membtn").title="メンバー";
+  $("profbtn").innerHTML=ic("user",20);$("profbtn").title="プロフィール";$("sqb").innerHTML=ic("search",18);$("sqb").title="検索";$("navbtn").title="メニュー";$("membtn").title="メンバー";
 }
 async function doAuth(kind){
   $("aerr").textContent="";
@@ -2169,7 +2191,7 @@ function setView(v,cid){
   const l=chanList();
   const t=cid&&l.some(c=>c.id===cid)?cid:(l[0]&&l[0].id);
   if(t)openChan(t,true);
-  else{S.chan=null;last=null;clearReply();$("bar").hidden=false;$("ronote").hidden=true;$("headt").textContent=v==="dm"?"ホーム":"";updateCallBtn();emptyState()}
+  else{S.chan=null;last=null;clearReply();$("profbtn").hidden=true;$("bar").hidden=false;$("ronote").hidden=true;$("headt").textContent=v==="dm"?"ホーム":"";updateCallBtn();emptyState()}
 }
 function goChannel(cid){
   if(cid===S.announce){openAnnounce();return}
@@ -2291,7 +2313,12 @@ async function openChan(cid,auto){
   const isA=cid===S.announce;
   const c=isA?{name:"公式アナウンス",kind:"announce"}:chanList().find(x=>x.id===cid);
   const ht=$("headt");ht.innerHTML="";
-  if(c)ht.append((isA||c.kind==="voice")?ico("speaker",19):(S.view==="dm"?el("span","at","@"):ico("hash",19)),document.createTextNode(c.name));
+  if(c){
+    const lead=(isA||c.kind==="voice")?ico("speaker",19):(S.view==="dm"?statusAvatar(c.name,"av xs",c.online):ico("hash",19));
+    const nm=el("span");nm.textContent=c.name;ht.append(lead,nm);
+  }
+  $("profbtn").hidden=!(c&&S.view==="dm"&&!isA);
+  $("sq").placeholder=(c?c.name:"")+"を検索";
   const ro=isA&&!S.owner;$("bar").hidden=ro;$("ronote").hidden=!ro;$("stampbox").hidden=true;
   updateCallBtn();
   $("msgs").innerHTML="";
@@ -2425,6 +2452,28 @@ function renderReactions(d,r){
   }
 }
 const react=(mid,emoji)=>wsend({type:"react",message_id:mid,emoji});
+function headProfile(){const c=S.dms.find(x=>x.id===S.chan);if(c)profileModal(c.name)}
+async function doSearch(fromBtn){
+  if(!S.chan)return;
+  let q=$("sq").value.trim();
+  if(!q||(fromBtn&&matchMedia("(max-width:820px)").matches)){
+    const f=await form("メッセージを検索",[{k:"q",label:"キーワード",value:q}],"検索");
+    if(!f||!f.q)return;q=f.q;
+  }
+  const cid=S.chan;
+  const d=await T(()=>api(`/api/channels/${cid}/search?q=${encodeURIComponent(q)}`));
+  if(!d)return;
+  const list=el("div","dlist");
+  if(!d.messages.length){const p=el("p","muted");p.textContent="見つかりませんでした";list.append(p)}
+  d.messages.forEach(m=>{
+    const row=el("div","drow"),box=el("div"),b=el("b"),sm=el("small"),t=el("div");
+    b.textContent=m.user;sm.textContent=fullTime(m.ts);t.textContent=m.text.slice(0,120);t.style.wordBreak="break-word";
+    box.append(b,sm,t);row.append(box);row.style.cursor="pointer";
+    row.onclick=()=>{closeModal();jumpTo(m.id)};list.append(row);
+  });
+  modal("「"+q+"」の検索結果",[list]);
+}
+$("sq").addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.isComposing)doSearch(false)});
 function setReply(m){
   S.reply={id:m.id,user:m.user};
   const b=$("replybar");b.innerHTML="";b.hidden=false;
