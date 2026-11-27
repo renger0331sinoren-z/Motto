@@ -78,6 +78,8 @@ create table if not exists messages(id integer primary key autoincrement, channe
     file_id text, file_name text, file_type text, ts real, mentions text default '[]');
 create table if not exists reactions(message_id integer, user_id integer, emoji text, ts real default 0, primary key(message_id, user_id, emoji));
 create table if not exists friends(user_id integer, friend_id integer, primary key(user_id, friend_id));
+create table if not exists blocks(user_id integer, blocked_id integer, primary key(user_id, blocked_id));
+create table if not exists mutes(user_id integer, muted_id integer, primary key(user_id, muted_id));
 create table if not exists stamps(id integer primary key autoincrement, name text, file_id text, mime text, owner_id integer, hidden integer default 0);
 create table if not exists emojis(id integer primary key autoincrement, name text, file_id text, mime text, owner_id integer, hidden integer default 0);
 create table if not exists kv(k text primary key, v text);
@@ -478,6 +480,41 @@ def friend_ids(uid):
     return [r[0] for r in db.execute("select friend_id from friends where user_id=?", (uid,))]
 
 
+def is_blocked_between(a, b):
+    """aとbのどちらかが相手をブロックしていれば True"""
+    return bool(db.execute(
+        "select 1 from blocks where (user_id=? and blocked_id=?) or (user_id=? and blocked_id=?)", (a, b, b, a)
+    ).fetchone())
+
+
+def dm_partner(uid, cid):
+    """1対1のDMなら相手のid。DM以外 (サーバー / グループ / アナウンス) は None"""
+    ch = db.execute("select server_id,kind from channels where id=?", (cid,)).fetchone()
+    if not ch or ch[0] is not None or (ch[1] or "") in ("group", "announce"):
+        return None
+    r = db.execute("select user_id from dm_members where channel_id=? and user_id!=?", (cid, uid)).fetchone()
+    return r[0] if r else None
+
+
+def ensure_dm_allowed(uid, cid):
+    """1対1のDMで、どちらかがブロックしていたら送信・通話を拒否する"""
+    pid = dm_partner(uid, cid)
+    if pid is None:
+        return
+    if db.execute("select 1 from blocks where user_id=? and blocked_id=?", (uid, pid)).fetchone():
+        raise HTTPException(403, "ブロック中のユーザーです。ブロックを解除すると送信できます")
+    if db.execute("select 1 from blocks where user_id=? and blocked_id=?", (pid, uid)).fetchone():
+        raise HTTPException(403, "このユーザーにはメッセージを送れません")
+
+
+def notif_suppressed(uid, sender_id):
+    """uid が sender_id をミュート / ブロックしていれば、その人からの通知は出さない"""
+    return bool(
+        db.execute("select 1 from mutes where user_id=? and muted_id=?", (uid, sender_id)).fetchone()
+        or db.execute("select 1 from blocks where user_id=? and blocked_id=?", (uid, sender_id)).fetchone()
+    )
+
+
 async def presence(uid, online):
     ids = set(friend_ids(uid))
     ids.update(r[0] for r in db.execute(
@@ -511,6 +548,7 @@ async def call_leave(uid, cid):
 
 async def call_join(ws, uid, name, cid):
     require(uid, cid)
+    ensure_dm_allowed(uid, cid)
     if cid == ANNOUNCE_CID:
         raise HTTPException(400, "このチャンネルでは通話できません")
     ch = db.execute("select server_id,kind from channels where id=?", (cid,)).fetchone()
@@ -615,13 +653,17 @@ async def me(u=Depends(current_user)):
             "invite": invite, "public": bool(pub), "icon": icon, "channels": chans,
         })
     dms = []
+    friend_set = set(friend_ids(uid))
+    muted_set = {r[0] for r in db.execute("select muted_id from mutes where user_id=?", (uid,))}
+    blocked_set = {r[0] for r in db.execute("select blocked_id from blocks where user_id=?", (uid,))}
     for cid, pid, pname in db.execute(
         "select c.id,u2.id,u2.name from channels c "
         "join dm_members d on d.channel_id=c.id and d.user_id=? "
         "join dm_members d2 on d2.channel_id=c.id and d2.user_id!=? "
         "join users u2 on u2.id=d2.user_id where c.server_id is null and coalesce(c.kind,'') not in ('announce','group') order by c.id", (uid, uid)
     ):
-        dms.append({"id": cid, "name": pname, "uid": pid, "online": bool(hub.users.get(pid))})
+        dms.append({"id": cid, "name": pname, "uid": pid, "online": bool(hub.users.get(pid)),
+                    "friend": pid in friend_set, "muted": pid in muted_set, "blocked": pid in blocked_set})
     for gid, gname, gowner in db.execute(
         "select c.id,c.name,c.owner_id from channels c join dm_members d on d.channel_id=c.id and d.user_id=? "
         "where c.server_id is null and c.kind='group' order by c.id", (uid,)
@@ -643,12 +685,20 @@ async def me(u=Depends(current_user)):
             "select u.id,u.name from friends f join users u on u.id=f.friend_id where f.user_id=? order by u.name", (uid,)
         )
     ]
+    blocked_list = [
+        {"id": i, "name": n}
+        for i, n in db.execute("select u.id,u.name from blocks b join users u on u.id=b.blocked_id where b.user_id=? order by u.name", (uid,))
+    ]
+    muted_list = [
+        {"id": i, "name": n}
+        for i, n in db.execute("select u.id,u.name from mutes m join users u on u.id=m.muted_id where m.user_id=? order by u.name", (uid,))
+    ]
     calls = {}
     for cid in list(hub.rooms):
         if hub.rooms.get(cid) and chan_info(uid, cid) is not None:
             calls[str(cid)] = room_users(cid)
     return {
-        "user": u, "servers": servers, "dms": dms, "friend_code": code, "friends": friends, "calls": calls,
+        "user": u, "servers": servers, "dms": dms, "friend_code": code, "friends": friends, "blocked": blocked_list, "muted": muted_list, "calls": calls,
         "notify_mode": row[1] or "mention", "push_available": HAVE_PUSH,
         "announce": ANNOUNCE_CID, "is_owner": is_site_owner(uid), "persistent": bool(DATABASE_URL),
     }
@@ -836,6 +886,8 @@ async def add_friend(b: dict, u=Depends(current_user)):
         raise HTTPException(404, "フレンドコードが見つかりません")
     if r[0] == u["id"]:
         raise HTTPException(400, "自分自身は追加できません")
+    if is_blocked_between(u["id"], r[0]):
+        raise HTTPException(403, "このユーザーとはフレンドになれません")
     db.execute("insert or ignore into friends values(?,?)", (u["id"], r[0]))
     db.execute("insert or ignore into friends values(?,?)", (r[0], u["id"]))
     db.commit()
@@ -849,6 +901,56 @@ async def remove_friend(b: dict, u=Depends(current_user)):
     db.execute("delete from friends where (user_id=? and friend_id=?) or (user_id=? and friend_id=?)", (u["id"], fid, fid, u["id"]))
     db.commit()
     await push([u["id"], fid], {"type": "refresh"})
+    return {"ok": True}
+
+
+def _target_user(u, b):
+    try:
+        tid = int(b.get("id", 0))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "不正なユーザーです")
+    if tid == u["id"]:
+        raise HTTPException(400, "自分自身は指定できません")
+    if not db.execute("select 1 from users where id=?", (tid,)).fetchone():
+        raise HTTPException(404, "そのユーザーは存在しません")
+    return tid
+
+
+@app.post("/api/blocks/add")
+async def block_add(b: dict, u=Depends(current_user)):
+    tid = _target_user(u, b)
+    db.execute("insert or ignore into blocks values(?,?)", (u["id"], tid))
+    # ブロックするとフレンドも解除する
+    db.execute("delete from friends where (user_id=? and friend_id=?) or (user_id=? and friend_id=?)", (u["id"], tid, tid, u["id"]))
+    db.commit()
+    await push([u["id"], tid], {"type": "refresh"})
+    return {"ok": True}
+
+
+@app.post("/api/blocks/remove")
+async def block_remove(b: dict, u=Depends(current_user)):
+    tid = _target_user(u, b)
+    db.execute("delete from blocks where user_id=? and blocked_id=?", (u["id"], tid))
+    db.commit()
+    await push([u["id"], tid], {"type": "refresh"})
+    return {"ok": True}
+
+
+@app.post("/api/mutes/add")
+async def mute_add(b: dict, u=Depends(current_user)):
+    tid = _target_user(u, b)
+    db.execute("insert or ignore into mutes values(?,?)", (u["id"], tid))
+    db.commit()
+    await push([u["id"]], {"type": "refresh"})
+    return {"ok": True}
+
+
+@app.post("/api/mutes/remove")
+async def mute_remove(b: dict, u=Depends(current_user)):
+    tid = _target_user(u, b)
+    db.execute("delete from mutes where user_id=? and muted_id=?", (u["id"], tid))
+    db.commit()
+    await push([u["id"]], {"type": "refresh"})
     return {"ok": True}
 
 
@@ -1067,6 +1169,8 @@ async def open_dm(b: dict, u=Depends(current_user)):
     ).fetchone()
     if r:
         return {"id": r[0]}
+    if is_blocked_between(u["id"], t[0]):
+        raise HTTPException(403, "このユーザーにはDMを送れません")
     cid = db.execute("insert into channels(server_id,name,kind) values(NULL,'dm','dm')").lastrowid
     db.executemany("insert into dm_members values(?,?)", [(cid, u["id"]), (cid, t[0])])
     db.commit()
@@ -1353,6 +1457,8 @@ async def push_offline(cid, msg, sender_id):
         row = db.execute("select name,notify_mode from users where id=?", (uid,)).fetchone()
         if not row or row[1] == "off":
             continue
+        if notif_suppressed(uid, sender_id):
+            continue
         hit = ch[0] is None or row[0] in msg["mentions"] or bool(msg["reply"] and msg["reply"]["user"] == row[0])
         if (row[1] or "mention") == "mention" and not hit:
             continue
@@ -1365,6 +1471,7 @@ async def push_offline(cid, msg, sender_id):
 
 
 async def post_message(uid, cid, text="", file=None, stamp=None, reply_to=None):
+    ensure_dm_allowed(uid, cid)
     if reply_to and not db.execute("select 1 from messages where id=? and channel_id=?", (reply_to, cid)).fetchone():
         reply_to = None
     ments = find_mentions(cid, text)
@@ -1489,6 +1596,7 @@ async def upload(cid: int, request: Request, name: str = "file",
                  type: str = "application/octet-stream", u=Depends(current_user)):
     """サイズ制限なし。受け取りながらディスクへ書くのでメモリを使わない。"""
     require(u["id"], cid, P_FILES)
+    ensure_dm_allowed(u["id"], cid)  # ブロック中ならファイルを受け取る前に断る
     fid = uuid.uuid4().hex
     path = UPLOADS / fid
     try:
@@ -1557,7 +1665,7 @@ async def ws_endpoint(ws: WebSocket, token: str = ""):
                 elif t == "typing":
                     cid = int(d["channel"])
                     require(uid, cid, P_SEND)
-                    await push([x for x in channel_users(cid) if x != uid], {"type": "typing", "channel": cid, "name": u["name"]})
+                    await push([x for x in channel_users(cid) if x != uid and not is_blocked_between(uid, x)], {"type": "typing", "channel": cid, "name": u["name"]})
                 elif t == "react":
                     await toggle_reaction(uid, int(d["message_id"]), str(d["emoji"])[:16])
                 elif t == "call_join":
@@ -2063,6 +2171,21 @@ body.big button{min-height:44px}
 #bpaste{display:none}
 @media(pointer:coarse),(max-width:820px){#bpaste{display:inline-flex}}
 .pastebox{display:flex;flex-direction:column;align-items:center;gap:10px}
+
+/* ---- ブロック / ミュート / フレンドメニュー (スマホ対応) ---- */
+.ch .xb{flex:none;min-width:34px;min-height:34px;display:inline-flex;align-items:center;justify-content:center;border-radius:10px}
+.ch .tg{flex:none;font-size:11px;line-height:1;white-space:nowrap;color:var(--tx2);background:var(--bg4);padding:3px 7px;border-radius:8px}
+.ch .tg.bad{color:var(--bad)}
+.srow .rm{min-height:38px}
+@media(pointer:coarse),(max-width:820px){
+ .ch{min-height:50px}
+ .ch .xb{opacity:1;min-width:42px;min-height:42px}
+ .mi{padding:15px 16px;font-size:15px;gap:12px}
+ #modal.sheet{align-items:flex-end;padding:0}
+ #modal.sheet #mbox{max-width:none;max-height:86vh;border-radius:22px 22px 0 0;padding:16px 14px calc(16px + var(--sab));animation:sheetUp .2s ease-out}
+ .srow .rm{width:100%;min-height:46px;justify-content:center}
+}
+@keyframes sheetUp{from{transform:translateY(40px);opacity:0}to{transform:none;opacity:1}}
 </style>
 
 <div id=auth>
@@ -2295,7 +2418,7 @@ async function logout(){
 }
 async function load(){
   const d=await api("/api/me");
-  S.me=d.user;S.servers=d.servers;S.dms=d.dms;S.friends=d.friends;S.code=d.friend_code;S.calls=d.calls||{};
+  S.me=d.user;S.servers=d.servers;S.dms=d.dms;S.friends=d.friends;S.blocked=d.blocked||[];S.mutedList=d.muted||[];S.quiet=new Set([...S.blocked,...S.mutedList].map(x=>x.name));S.code=d.friend_code;S.calls=d.calls||{};
   S.persistent=!!d.persistent;S.notify=d.notify_mode;S.push=d.push_available;S.announce=d.announce;S.owner=d.is_owner;
   if(S.view!=="dm"&&!S.servers.find(s=>s.id===S.view))S.view="dm";
   const mi=$("meinfo");mi.innerHTML="";const nm=el("span");nm.textContent=S.me.name;mi.append(avatar(S.me.name,"av sm2"),nm);mi.style.cursor="pointer";mi.onclick=()=>profileModal(S.me.name);
@@ -2383,7 +2506,7 @@ async function showNotif(title,body,cid){
   try{const n=new Notification(title,opt);n.onclick=()=>{window.focus();goChannel(cid);n.close()}}catch(e){}
 }
 function notifyMsg(m){
-  if(m.user===S.me.name||S.notify==="off")return;
+  if(m.user===S.me.name||S.notify==="off"||(S.quiet&&S.quiet.has(m.user)))return;
   const srv=S.servers.find(s=>s.channels.some(c=>c.id===m.channel));
   const hit=!srv||m.mentions.includes(S.me.name)||(m.reply&&m.reply.user===S.me.name);
   if(S.notify==="mention"&&!hit)return;
@@ -2476,11 +2599,22 @@ function drawRail(){
 }
 const mitem=(icon,label,fn)=>{const b=el("button","mi ghost",ic(icon)+`<span>${label}</span>`);b.onclick=()=>{closeModal();fn()};return b};
 function friendMenu(f){
-  modal(f.name,[
-    mitem("user","プロフィールを見る",()=>profileModal(f.name)),
-    mitem("send","メッセージを送る",()=>openDm(f.name)),
-    mitem("trash","フレンドを削除",async()=>{if(await confirmBox(f.name+" をフレンドから削除しますか？","削除"))T(()=>api("/api/friends/remove","POST",{id:f.id}))})
-  ]);
+  const act=(path,msg)=>T(async()=>{await api(path,"POST",{id:f.id});await load();toast(msg)});
+  const items=[mitem("user","プロフィールを見る",()=>profileModal(f.name))];
+  if(!f.blocked)items.push(mitem("send","メッセージを送る",()=>openDm(f.name)));
+  if(f.friend)items.push(mitem("trash","フレンドを削除",async()=>{
+    if(await confirmBox(f.name+" をフレンドから削除しますか？ (DMの履歴は残ります)","削除"))act("/api/friends/remove",f.name+" をフレンドから削除しました")
+  }));
+  items.push(f.muted
+    ?mitem("bell","通知のミュートを解除",()=>act("/api/mutes/remove",f.name+" からの通知を再開しました"))
+    :mitem("bell","この人からの通知をミュート",()=>act("/api/mutes/add",f.name+" からの通知をミュートしました")));
+  items.push(f.blocked
+    ?mitem("shield","ブロックを解除",()=>act("/api/blocks/remove",f.name+" のブロックを解除しました"))
+    :mitem("shield","ブロック",async()=>{
+      if(await confirmBox(f.name+" をブロックしますか？ フレンドから外れ、お互いにDMを送れなくなります","ブロック"))act("/api/blocks/add",f.name+" をブロックしました")
+    }));
+  $("modal").classList.add("sheet");  // スマホでは下から出るメニューにする
+  modal(f.name,items,()=>$("modal").classList.remove("sheet"));
 }
 function openAnnounce(){S.view="dm";drawRail();drawMembers();openChan(S.announce)}
 function updateAnnBtn(){
@@ -3460,10 +3594,14 @@ function drawList(){
     const d=el("div","ch"+(c.id===S.chan?" active":"")+(S.unread[c.id]?" unread":""));
     const lead=S.view==="dm"?(c.group?groupAv("av xs"):statusAvatar(c.name,"av xs",c.online)):ico(c.kind==="voice"?"speaker":"hash",18);
     const n=el("span","cn");n.textContent=c.name;d.append(lead,n);
+    if(S.view==="dm"&&!c.group){
+      const tg=c.blocked?"ブロック中":c.muted?"ミュート中":!c.friend?"フレンドではない":"";
+      if(tg){const s=el("span","tg"+(c.blocked?" bad":""));s.textContent=tg;d.append(s)}
+    }
     const cu=S.calls[c.id]||[];
     if(S.view==="dm"&&cu.length)d.append(ico("phone",15));
     if(S.ment[c.id])d.append(badge(S.ment[c.id]));
-    if(S.view==="dm"&&!c.group)d.append(ibtn("more","",e=>{e.stopPropagation();friendMenu({id:c.uid,name:c.name})},"xb","メニュー"));
+    if(S.view==="dm"&&!c.group)d.append(ibtn("more","",e=>{e.stopPropagation();friendMenu({id:c.uid,name:c.name,friend:c.friend,muted:c.muted,blocked:c.blocked})},"xb","メニュー"));
     if(c.group)d.append(ibtn("more","",e=>{e.stopPropagation();groupMenu(c)},"xb","グループ設定"));
     d.onclick=()=>openChan(c.id);wrap.append(d);
     if(c.kind==="voice")cu.forEach(u=>{
@@ -3575,7 +3713,7 @@ function sRange(min,max,step,val,fn,fmt){
   i.oninput=()=>{o.textContent=fmt(i.value);fn(Number(i.value))};w.append(i,o);return w;
 }
 const SET_CATS=[["acct","user","マイアカウント"],["prof","pencil","プロフィール"],["appear","globe","外観"],["chat","send","チャット"],
-  ["notif","bell","通知"],["voice","mic","音声・ビデオ"],["access","zoomin","アクセシビリティ"],["data","shield","データ・保存"],["about","gear","アプリについて"]];
+  ["notif","bell","通知"],["block","shield","ブロック・ミュート"],["voice","mic","音声・ビデオ"],["access","zoomin","アクセシビリティ"],["data","shield","データ・保存"],["about","gear","アプリについて"]];
 function closeSettings(fromPop){
   const o=$("settings");if(o)o.remove();
   const id=setUi;setUi=0;if(id&&fromPop!==true)uiClosed(id);
@@ -3633,6 +3771,18 @@ function settingsModal(page){
       c.append(desc);
       c.append(sRow("通知音を鳴らす","新しいメッセージが届いたとき",sSwitch(S.sound,v=>{S.sound=v;localStorage.sound=v?"1":"0"})));
       c.append(sNote(S.push?"Push通知が有効なので、アプリを閉じていても通知が届きます (iPhoneはホーム画面に追加してください)。":"サーバー側でPush通知が未設定のため、通知はこのアプリを開いている間だけ届きます。"));
+    },
+    block(c){
+      const list=(title,arr,path,none)=>{
+        c.append(sHead(title));
+        if(!arr.length)c.append(sNote(none));
+        arr.forEach(x=>c.append(sRow(x.name,"",ibtn("x","解除",async()=>{
+          if(await T(()=>api(path,"POST",{id:x.id}))){await load();show("block")}
+        },"ghost rm"))));
+      };
+      list("ブロック中のユーザー",S.blocked||[],"/api/blocks/remove","ブロックしているユーザーはいません。");
+      list("通知をミュート中のユーザー",S.mutedList||[],"/api/mutes/remove","ミュートしているユーザーはいません。");
+      c.append(sNote("ブロック: フレンドから外れ、お互いにDMやDM通話ができなくなります。ミュート: その人からの通知だけを止めます (メッセージは今までどおり届きます)。ユーザーは、ホームのDM一覧の「…」メニューから追加できます。"));
     },
     voice(c){
       c.append(sHead("入力"));
