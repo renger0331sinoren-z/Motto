@@ -2060,6 +2060,9 @@ body.big button{min-height:44px}
 #bvoice.rec{background:var(--bad)!important;color:#fff!important;animation:recpulse 1.2s infinite}
 @keyframes recpulse{50%{box-shadow:0 0 0 6px color-mix(in srgb,var(--bad) 30%,transparent)}}
 .vmsg audio{width:min(320px,100%);height:40px;display:block;margin-top:6px}
+#bpaste{display:none}
+@media(pointer:coarse),(max-width:820px){#bpaste{display:inline-flex}}
+.pastebox{display:flex;flex-direction:column;align-items:center;gap:10px}
 </style>
 
 <div id=auth>
@@ -3663,7 +3666,7 @@ function settingsModal(page){
     about(c){
       c.append(sRow("Motto","バージョン 5",null));
       c.append(sRow("ホーム画面に追加","スマホではブラウザのメニューから「ホーム画面に追加」するとアプリのように使えます",null));
-      c.append(sRow("キーボード","Enter: 送信 / Esc: 閉じる",null));
+      c.append(sRow("キーボード","Enter: 送信 / Ctrl+V: 画像を貼り付け / Esc: 閉じる",null));
     }
   };
   function show(key){
@@ -3738,6 +3741,62 @@ async function toggleVoiceRec(){
   recUI(true);
 }
 function stopRec(send){if(!rec)return;rec.cancel=!send;try{rec.mr.stop()}catch(e){rec.st.getTracks().forEach(t=>t.stop());rec=null;recUI(false)}}
+
+/* ---------- クリップボードから貼り付け (Ctrl+V / スマホはボタン) ---------- */
+const pad2=n=>String(n).padStart(2,"0");
+function clipName(f){
+  if(f.name&&!/^image\.[a-z0-9]+$/i.test(f.name))return f.name;
+  const d=new Date(),ext=((f.type||"image/png").split("/")[1]||"png").split("+")[0];
+  return `スクリーンショット-${d.getFullYear()}${pad2(d.getMonth()+1)}${pad2(d.getDate())}-${pad2(d.getHours())}${pad2(d.getMinutes())}${pad2(d.getSeconds())}.${ext}`;
+}
+async function sendFiles(files,cid){
+  for(const f of files){
+    const name=clipName(f);
+    try{
+      await upload(`/api/channels/${cid}/upload?name=${encodeURIComponent(name)}&type=${encodeURIComponent(f.type||"application/octet-stream")}`,f,
+        e=>{$("prog").textContent=`アップロード中 ${(e.loaded/e.total*100).toFixed(1)}%`});
+    }catch(e){toast(e.message)}
+  }
+  $("prog").textContent="";
+}
+function pasteSend(files){
+  if(!S.chan){return}
+  if(S.chan===S.announce&&!S.owner){toast("ここには送信できません");return}
+  const cid=S.chan,box=el("div","pastebox");
+  files.forEach(f=>{
+    if((f.type||"").startsWith("image/")){const i=el("img","pv");i.src=URL.createObjectURL(f);i.style.maxWidth="100%";i.style.maxHeight="260px";box.append(i)}
+    else{const t=el("div","muted");t.textContent=clipName(f);box.append(t)}
+  });
+  const go=el("button","btn","送信する"),no=el("button","ghost","やめる");
+  no.onclick=()=>closeModal();
+  go.onclick=()=>{closeModal();sendFiles(files,cid)};
+  const row=el("div","row");row.append(no,go);
+  modal(files.length>1?"貼り付けた "+files.length+" 個を送る":"貼り付けたものを送る",[box,row]);
+  setTimeout(()=>go.focus(),80);
+}
+document.addEventListener("paste",e=>{
+  if(!S.me||!S.chan||$("settings")||!$("modal").hidden||document.querySelector(".crop"))return;
+  const cd=e.clipboardData;if(!cd)return;
+  let files=[...(cd.files||[])];
+  if(!files.length)files=[...(cd.items||[])].filter(i=>i.kind==="file").map(i=>i.getAsFile()).filter(Boolean);
+  if(!files.length)return;
+  e.preventDefault();pasteSend(files);
+});
+async function pasteFromClipboard(){
+  if(!navigator.clipboard||!navigator.clipboard.read){toast("このブラウザはクリップボードの読み取りに未対応です。クリップのボタンから画像を選んでください");return}
+  try{
+    const items=await navigator.clipboard.read(),files=[];
+    for(const it of items){
+      const ty=it.types.find(t=>t.startsWith("image/"));
+      if(ty){const b=await it.getType(ty);files.push(new File([b],"image."+(ty.split("/")[1]||"png").split("+")[0],{type:ty}))}
+    }
+    if(files.length){pasteSend(files);return}
+    const t=await navigator.clipboard.readText().catch(()=>"");
+    if(t){$("txt").value+=t;$("txt").focus()}else toast("クリップボードに画像がありません");
+  }catch(e){toast("クリップボードを読み取れませんでした。貼り付けを許可してください")}
+}
+const bpaste=ibtn("copy","",pasteFromClipboard,"ghost","クリップボードから貼り付け");bpaste.id="bpaste";
+$("bclip").after(bpaste);
 
 applyPrefs();
 applyTheme();
