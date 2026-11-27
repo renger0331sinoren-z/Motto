@@ -1,5 +1,5 @@
 """
-Moot v4  (FastAPI + WebSocket + WebRTC + SQLite)
+Motto v4  (FastAPI + WebSocket + WebRTC + SQLite)
 
 主な機能
   - アカウント / フレンド(コード招待) / サーバー(作成・参加・公開検索) / ロール / DM
@@ -29,8 +29,25 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 
 app = FastAPI()
 
-DATA = Path(os.environ.get("DATA_DIR", "."))
+def _pick_data_dir():
+    """データ保存先。再デプロイ(アップデート)でも消えないよう、永続ディスクを優先して使う。"""
+    env = os.environ.get("DATA_DIR", "").strip()
+    if env:
+        return Path(env)
+    for cand in ("/var/data", "/data", "/mnt/data"):  # Render / Fly などの永続ディスクの定番の場所
+        p = Path(cand)
+        if p.is_dir() and os.access(cand, os.W_OK):
+            return p
+    return Path(".")
+
+
+DATA = _pick_data_dir()
 DATA.mkdir(parents=True, exist_ok=True)
+if not os.environ.get("DATABASE_URL", "").strip():
+    if str(DATA.resolve()) == str(Path(".").resolve()):
+        print("警告: データをプログラムと同じ場所に保存しています。Renderなどでは更新のたびに消えます。"
+              "環境変数 DATABASE_URL に外部データベース(Neon)の接続URLを設定してください。")
+    print("データ保存先:", DATA.resolve())
 UPLOADS = DATA / "uploads"
 UPLOADS.mkdir(exist_ok=True)
 MAX_STAMP = 5 * 1024 * 1024  # スタンプ画像は5MBまで (通常ファイルは無制限)
@@ -40,9 +57,10 @@ OWNER_NAME = os.environ.get("OWNER_NAME", "").strip()  # 公式アナウンス�
 MAX_CALL = 8  # 通話の最大人数 (メッシュ接続なので多すぎると重くなります)
 
 # ------------------------------------------------------------------ DB
-db = sqlite3.connect(str(DATA / "minicord.db"), check_same_thread=False)
-db.executescript(
-    """
+# DATABASE_URL (Neon などの外部PostgreSQL) があればそこに保存 → 更新しても消えない。
+# 無ければ従来どおり SQLite (minicord.db) を使う。
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+SCHEMA = """
 create table if not exists users(id integer primary key autoincrement, name text unique, salt blob, pw blob, created real);
 create table if not exists sessions(token text primary key, user_id integer, created real);
 create table if not exists servers(id integer primary key autoincrement, name text, owner_id integer, invite text unique);
@@ -53,7 +71,7 @@ create table if not exists channels(id integer primary key autoincrement, server
 create table if not exists dm_members(channel_id integer, user_id integer, primary key(channel_id, user_id));
 create table if not exists messages(id integer primary key autoincrement, channel_id integer, user_id integer, text text,
     file_id text, file_name text, file_type text, ts real, mentions text default '[]');
-create table if not exists reactions(message_id integer, user_id integer, emoji text, primary key(message_id, user_id, emoji));
+create table if not exists reactions(message_id integer, user_id integer, emoji text, ts real default 0, primary key(message_id, user_id, emoji));
 create table if not exists friends(user_id integer, friend_id integer, primary key(user_id, friend_id));
 create table if not exists stamps(id integer primary key autoincrement, name text, file_id text, mime text, owner_id integer, hidden integer default 0);
 create table if not exists emojis(id integer primary key autoincrement, name text, file_id text, mime text, owner_id integer, hidden integer default 0);
@@ -61,15 +79,7 @@ create table if not exists kv(k text primary key, v text);
 create table if not exists push_subs(endpoint text primary key, user_id integer, sub text);
 create index if not exists idx_msg on messages(channel_id, id);
 """
-)
-
-
-def _has_col(t, c):
-    return any(r[1] == c for r in db.execute(f"pragma table_info({t})"))
-
-
-# 古いDB(v2/v3)からの移行
-for _t, _c, _d in [
+MIGRATIONS = [  # 古いDB(v2/v3)からの移行
     ("messages", "stamp_id", "integer"),
     ("messages", "reply_to", "integer"),
     ("channels", "kind", "text default 'text'"),
@@ -84,9 +94,141 @@ for _t, _c, _d in [
     ("servers", "icon_file", "text"),
     ("servers", "icon_mime", "text"),
     ("servers", "icon_ver", "integer"),
-]:
-    if not _has_col(_t, _c):
-        db.execute(f"alter table {_t} add column {_c} {_d}")
+    ("reactions", "ts", "real default 0"),
+]
+_ID_TABLES = {"users", "servers", "roles", "channels", "messages", "stamps", "emojis"}  # id列があるテーブル
+_UPSERT = {"kv": ("k", ["v"]), "push_subs": ("endpoint", ["user_id", "sub"])}
+
+
+def pg_type(sql):
+    """SQLiteの型名をPostgreSQLの型名に直す"""
+    sql = re.sub(r"\binteger primary key autoincrement\b", "bigserial primary key", sql)
+    sql = re.sub(r"\binteger\b", "bigint", sql)
+    sql = re.sub(r"\breal\b", "double precision", sql)
+    return re.sub(r"\bblob\b", "bytea", sql)
+
+
+def pg_sql(sql):
+    """SQLite用に書いたSQLをPostgreSQL用に変換する"""
+    s = sql.strip().replace("%", "%%").replace("?", "%s")
+    s = re.sub(r"\blike\b", "ilike", s)  # SQLiteのLIKEは大文字小文字を区別しない
+    suffix = ""
+    if re.match(r"insert or ignore into", s):
+        s = s.replace("insert or ignore into", "insert into", 1)
+        suffix = " on conflict do nothing"
+    else:
+        m = re.match(r"insert or replace into (\w+)", s)
+        if m:
+            key, cols = _UPSERT[m.group(1)]
+            s = s.replace("insert or replace into", "insert into", 1)
+            suffix = f" on conflict ({key}) do update set " + ",".join(f"{c}=excluded.{c}" for c in cols)
+        else:
+            m = re.match(r"insert into (\w+)", s)
+            if m and m.group(1) in _ID_TABLES:
+                suffix = " returning id"
+    return s + suffix
+
+
+class _Res:
+    def __init__(self, rows=None, rowcount=-1, lastrowid=None):
+        self._rows, self.rowcount, self.lastrowid, self._i = rows or [], rowcount, lastrowid, 0
+
+    @staticmethod
+    def _fix(r):
+        return tuple(bytes(x) if isinstance(x, memoryview) else x for x in r)
+
+    def fetchone(self):
+        if self._i < len(self._rows):
+            self._i += 1
+            return self._fix(self._rows[self._i - 1])
+        return None
+
+    def fetchall(self):
+        out = [self._fix(r) for r in self._rows[self._i:]]
+        self._i = len(self._rows)
+        return out
+
+    def __iter__(self):
+        return iter(self.fetchall())
+
+
+class PGDB:
+    """sqlite3 のように db.execute(...) で使える PostgreSQL 接続 (切れたら自動で再接続)"""
+
+    def __init__(self, url):
+        import psycopg2  # noqa
+
+        self.pg = psycopg2
+        self.url = url
+        self.conn = None
+        self._connect()
+
+    def _connect(self):
+        self.conn = self.pg.connect(self.url, connect_timeout=15, keepalives=1, keepalives_idle=30,
+                                    keepalives_interval=10, keepalives_count=3)
+        self.conn.autocommit = True  # 1文ごとに確定する (commit() は何もしない)
+
+    def _run(self, fn):
+        for attempt in (0, 1):
+            try:
+                with self.conn.cursor() as cur:
+                    return fn(cur)
+            except (self.pg.OperationalError, self.pg.InterfaceError):
+                if attempt:
+                    raise
+                try:
+                    self.conn.close()
+                except Exception:
+                    pass
+                self._connect()
+
+    def execute(self, sql, params=()):
+        q = pg_sql(sql)
+
+        def go(cur):
+            cur.execute(q, tuple(params))
+            rows = cur.fetchall() if cur.description else []
+            last = rows[0][0] if rows and q.endswith("returning id") else None
+            return _Res([] if last is not None else rows, cur.rowcount, last)
+
+        return self._run(go)
+
+    def executemany(self, sql, seq):
+        q = pg_sql(sql)
+        self._run(lambda cur: cur.executemany(q, [tuple(p) for p in seq]))
+
+    def executescript(self, script):
+        for st in pg_type(script).split(";"):
+            if st.strip():
+                self._run(lambda cur, st=st: cur.execute(st))
+
+    def commit(self):
+        pass
+
+
+if DATABASE_URL:
+    try:
+        db = PGDB(DATABASE_URL)
+    except ImportError:
+        raise RuntimeError("DATABASE_URL が設定されていますが psycopg2-binary が入っていません (requirements.txt を確認してください)")
+    DB_ERRORS = (sqlite3.IntegrityError, db.pg.IntegrityError)
+    print("データ保存先: 外部データベース (PostgreSQL)")
+    db.executescript(SCHEMA)
+    for _t, _c, _d in MIGRATIONS:
+        db.execute(f"alter table {_t} add column if not exists {_c} {pg_type(_d)}")
+else:
+    db = sqlite3.connect(str(DATA / "minicord.db"), check_same_thread=False)  # 旧バージョンと同じファイル名のまま (データ引き継ぎのため)
+    DB_ERRORS = (sqlite3.IntegrityError,)
+    db.execute("pragma journal_mode=WAL")
+    db.execute("pragma synchronous=NORMAL")
+    db.executescript(SCHEMA)
+
+    def _has_col(t, c):
+        return any(r[1] == c for r in db.execute(f"pragma table_info({t})"))
+
+    for _t, _c, _d in MIGRATIONS:
+        if not _has_col(_t, _c):
+            db.execute(f"alter table {_t} add column {_c} {_d}")
 db.commit()
 
 # 公式アナウンス用の特別なチャンネル (全員が読めて、オーナーだけが投稿できる)
@@ -463,7 +605,7 @@ async def update_profile(b: dict, u=Depends(current_user)):
                 raise HTTPException(400, "その名前は使われています")
             try:
                 db.execute("update users set name=? where id=?", (name, uid))
-            except sqlite3.IntegrityError:
+            except DB_ERRORS:
                 raise HTTPException(400, "その名前は使われています")
             for room in hub.rooms.values():
                 if uid in room:
@@ -503,7 +645,7 @@ async def delete_avatar(u=Depends(current_user)):
 @app.get("/api/avatar")
 async def avatar_img(name: str, u=Depends(current_user)):
     r = db.execute("select avatar_file,avatar_mime from users where name=?", (name,)).fetchone()
-    if not r or not r[0]:
+    if not r or not r[0] or not (UPLOADS / r[0]).exists():
         raise HTTPException(404)
     return FileResponse(
         UPLOADS / r[0], media_type=r[1],
@@ -686,7 +828,7 @@ async def delete_server_icon(sid: int, u=Depends(current_user)):
 @app.get("/api/servers/{sid}/icon")
 async def server_icon(sid: int, u=Depends(current_user)):
     r = db.execute("select icon_file,icon_mime from servers where id=?", (sid,)).fetchone()
-    if not r or not r[0]:
+    if not r or not r[0] or not (UPLOADS / r[0]).exists():
         raise HTTPException(404)
     return FileResponse(
         UPLOADS / r[0], media_type=r[1],
@@ -828,7 +970,7 @@ async def save_image(request: Request, limit: int):
 
 def image_response(table, iid):
     r = db.execute(f"select file_id,mime from {table} where id=?", (iid,)).fetchone()
-    if not r:
+    if not r or not (UPLOADS / r[0]).exists():
         raise HTTPException(404)
     return FileResponse(
         UPLOADS / r[0], media_type=r[1],
@@ -838,8 +980,8 @@ def image_response(table, iid):
 
 @app.get("/api/stamps")
 async def list_stamps(u=Depends(current_user)):
-    rows = db.execute("select id,name,owner_id from stamps where hidden=0 order by id").fetchall()
-    return {"stamps": [{"id": r[0], "name": r[1], "mine": r[2] == u["id"]} for r in rows]}
+    rows = db.execute("select id,name,owner_id,file_id from stamps where hidden=0 order by id").fetchall()
+    return {"stamps": [{"id": r[0], "name": r[1], "mine": r[2] == u["id"]} for r in rows if (UPLOADS / r[3]).exists()]}
 
 
 @app.post("/api/stamps")
@@ -868,8 +1010,8 @@ async def stamp_img(sid: int, u=Depends(current_user)):
 
 @app.get("/api/emojis")
 async def list_emojis(u=Depends(current_user)):
-    rows = db.execute("select id,name,owner_id from emojis where hidden=0 order by name").fetchall()
-    return {"emojis": [{"id": r[0], "name": r[1], "mine": r[2] == u["id"]} for r in rows]}
+    rows = db.execute("select id,name,owner_id,file_id from emojis where hidden=0 order by name").fetchall()
+    return {"emojis": [{"id": r[0], "name": r[1], "mine": r[2] == u["id"]} for r in rows if (UPLOADS / r[3]).exists()]}
 
 
 @app.post("/api/emojis")
@@ -923,7 +1065,7 @@ MSG_SQL = (
 def reactions_of(mid):
     d: dict[str, list[str]] = {}
     for emoji, name in db.execute(
-        "select r.emoji,u.name from reactions r join users u on u.id=r.user_id where r.message_id=? order by r.rowid", (mid,)
+        "select r.emoji,u.name from reactions r join users u on u.id=r.user_id where r.message_id=? order by r.ts", (mid,)
     ):
         d.setdefault(emoji, []).append(name)
     return d
@@ -941,11 +1083,15 @@ def reply_info(rid):
     return {"id": r[0], "user": r[1], "text": (r[2] or "")[:80], "kind": kind}
 
 
-def row_to_msg(r):
+_NO = object()
+
+
+def row_to_msg(r, rx=_NO, rep=_NO):
     return {
         "id": r[0], "channel": r[1], "user": r[2], "text": r[3], "file_id": r[4], "file_name": r[5],
         "file_type": r[6], "ts": r[7], "mentions": json.loads(r[8]), "stamp": r[9],
-        "reply": reply_info(r[10]), "edited": bool(r[11]), "reactions": reactions_of(r[0]),
+        "reply": reply_info(r[10]) if rep is _NO else rep, "edited": bool(r[11]),
+        "reactions": reactions_of(r[0]) if rx is _NO else rx,
     }
 
 
@@ -1015,7 +1161,7 @@ async def toggle_reaction(uid, mid, emoji):
         return
     cur = db.execute("delete from reactions where message_id=? and user_id=? and emoji=?", (mid, uid, emoji))
     if cur.rowcount == 0:
-        db.execute("insert into reactions values(?,?,?)", (mid, uid, emoji))
+        db.execute("insert into reactions values(?,?,?,?)", (mid, uid, emoji, time.time()))
     db.commit()
     await push(channel_users(r[0]), {"type": "reactions", "channel": r[0], "message_id": mid, "reactions": reactions_of(mid)})
 
@@ -1024,7 +1170,25 @@ async def toggle_reaction(uid, mid, emoji):
 async def get_messages(cid: int, u=Depends(current_user)):
     require(u["id"], cid)
     rows = db.execute(MSG_SQL + "where m.channel_id=? order by m.id desc limit 100", (cid,)).fetchall()
-    return {"messages": [row_to_msg(r) for r in reversed(rows)]}
+    rows = list(reversed(rows))
+    ids = [r[0] for r in rows]
+    rx: dict = {i: {} for i in ids}
+    if ids:
+        for mid, emoji, name in db.execute(
+            "select r.message_id,r.emoji,u.name from reactions r join users u on u.id=r.user_id "
+            f"where r.message_id in ({','.join('?' * len(ids))}) order by r.ts", ids
+        ):
+            rx[mid].setdefault(emoji, []).append(name)
+    rids = list({r[10] for r in rows if r[10]})
+    reps: dict = {}
+    if rids:
+        for x in db.execute(
+            "select m.id,u.name,m.text,m.file_id,m.stamp_id from messages m join users u on u.id=m.user_id "
+            f"where m.id in ({','.join('?' * len(rids))})", rids
+        ):
+            reps[x[0]] = {"id": x[0], "user": x[1], "text": (x[2] or "")[:80],
+                          "kind": "stamp" if x[4] else ("file" if x[3] and not x[2] else "text")}
+    return {"messages": [row_to_msg(r, rx[r[0]], reps.get(r[10]) if r[10] else None) for r in rows]}
 
 
 @app.post("/api/messages/{mid}/edit")
@@ -1101,7 +1265,7 @@ async def upload(cid: int, request: Request, name: str = "file",
 @app.get("/files/{fid}")
 async def get_file(fid: str, u=Depends(current_user)):
     r = db.execute("select channel_id,file_name,file_type from messages where file_id=?", (fid,)).fetchone()
-    if not r or chan_info(u["id"], r[0]) is None:
+    if not r or chan_info(u["id"], r[0]) is None or not (UPLOADS / fid).exists():
         raise HTTPException(404)
     ftype = r[2] or ""
     # HTML等をその場で開くとXSSになるので、動画/音声/一部の画像だけ表示し、他はダウンロード扱い
@@ -1215,7 +1379,7 @@ async def icon_mask():
 async def manifest():
     return JSONResponse(
         {
-            "name": "Moot", "short_name": "Moot", "description": "みんなともっと楽しい時間を",
+            "name": "Motto", "short_name": "Motto", "description": "みんなともっと楽しい時間を",
             "start_url": "/", "scope": "/", "display": "standalone",
             "background_color": "#0f1015", "theme_color": "#0f1015",
             "icons": [
@@ -1233,7 +1397,7 @@ self.addEventListener("install",()=>self.skipWaiting());
 self.addEventListener("activate",e=>e.waitUntil(self.clients.claim()));
 self.addEventListener("push",e=>{
   let d={};try{d=e.data.json()}catch(x){}
-  e.waitUntil(self.registration.showNotification(d.title||"Moot",{
+  e.waitUntil(self.registration.showNotification(d.title||"Motto",{
     body:d.body||"",icon:"/icon-192.png",badge:"/icon-192.png",tag:d.tag||"minicord",data:{channel:d.channel}}));
 });
 self.addEventListener("notificationclick",e=>{
@@ -1260,7 +1424,7 @@ PAGE = r"""<!doctype html><meta charset=utf-8>
 <meta name=theme-color content="#0f1015">
 <meta name=mobile-web-app-capable content=yes>
 <meta name=apple-mobile-web-app-capable content=yes>
-<title>Moot</title>
+<title>Motto</title>
 <link rel=preconnect href=https://fonts.googleapis.com><link rel=preconnect href=https://fonts.gstatic.com crossorigin>
 <link rel=stylesheet href="https://fonts.googleapis.com/css2?family=M+PLUS+Rounded+1c:wght@400;500;700;800&display=swap">
 <script>(function(){var t=localStorage.theme||"system";var l=t==="light"||(t==="system"&&matchMedia("(prefers-color-scheme: light)").matches);document.documentElement.dataset.theme=l?"light":"dark"})()</script>
@@ -1455,6 +1619,7 @@ input[type=checkbox]{width:auto}
 .sdot.on{background:var(--ok);box-shadow:0 0 8px var(--ok)}
 .addbar{width:100%;background:transparent;border:2px solid var(--acc);color:var(--acc);border-radius:16px;padding:12px;font-weight:700;margin-bottom:10px;box-shadow:0 0 16px color-mix(in srgb,var(--acc) 28%,transparent)}
 .addbar:hover{background:color-mix(in srgb,var(--acc) 12%,transparent);filter:none}
+#annb{position:relative;color:#ff9500}#annb.active{background:var(--bg4)}#annb .badge{position:absolute;top:-5px;right:-5px;font-size:10px;line-height:15px;padding:0 5px}#annb .udot{position:absolute;top:3px;right:3px;width:9px;height:9px;border-radius:50%;background:var(--bad);border:2px solid var(--bg)}
 .annc{display:flex;align-items:center;gap:12px;padding:10px;border-radius:16px;background:color-mix(in srgb,#ff9500 14%,var(--bg2));border:1.5px solid #ff950099;cursor:pointer;font-weight:800;margin-bottom:10px}
 .annc.active{box-shadow:0 0 0 2px #ff9500}.annc .annt{flex:1}
 .annic{width:42px;height:42px;border-radius:12px;background:#ff9500;color:#fff;display:flex;align-items:center;justify-content:center;flex:none}
@@ -1486,7 +1651,7 @@ body.pop .annt{color:#ff9500}
 <div id=auth>
  <div id=authbox>
   <img class=logo src=/icon-192.png alt="">
-  <h1>Moot</h1>
+  <h1>Motto</h1>
   <p class=muted>みんなともっと楽しい時間を</p>
   <input id=an placeholder="ユーザー名" autocomplete=username>
   <input id=ap type=password placeholder="パスワード (6文字以上)" autocomplete=current-password>
@@ -1501,7 +1666,7 @@ body.pop .annt{color:#ff9500}
   <div id=rail></div>
   <div id=side>
    <div id=sidehead></div><div id=list></div>
-   <div id=meb><div id=meinfo></div><button id=gearb class="ghost sq" onclick="settingsModal()"></button></div>
+   <div id=meb><div id=meinfo></div><button id=annb class="ghost sq" onclick="openAnnounce()"></button><button id=gearb class="ghost sq" onclick="settingsModal()"></button></div>
   </div>
  </div>
  <div id=scrim hidden></div>
@@ -1690,7 +1855,7 @@ function confirmBox(msg,ok="OK"){
 
 /* ---------- ログイン / 起動 ---------- */
 function initIcons(){
-  $("navbtn").innerHTML=ic("menu",22);$("membtn").innerHTML=ic("users",20);$("gearb").innerHTML=ic("gear",19);$("gearb").title="設定";
+  $("navbtn").innerHTML=ic("menu",22);$("membtn").innerHTML=ic("users",20);$("gearb").innerHTML=ic("gear",19);$("gearb").title="設定";$("annb").innerHTML=ic("speaker",19);$("annb").title="公式アナウンス";
   $("bclip").innerHTML=ic("clip",21);$("bclip").title="ファイルを送信";$("bstamp").innerHTML=ic("sticker",21);$("bstamp").title="スタンプ";
   $("bemoji").innerHTML=ic("smile",21);$("bemoji").title="絵文字";
   $("bsend").innerHTML=ic("send",18)+'<span class="lbl">送信</span>';$("bsend").title="送信";
@@ -1777,7 +1942,7 @@ function onEvent(e){
 window.addEventListener("focus",()=>{if(S.chan){S.unread[S.chan]=0;S.ment[S.chan]=0;if(S.me)drawList()}});
 
 /* ---------- 通知 ---------- */
-function updateTitle(){const n=Object.keys(S.unread).filter(k=>S.unread[k]).length;document.title=(n?`(${n}) `:"")+"Moot"}
+function updateTitle(){const n=Object.keys(S.unread).filter(k=>S.unread[k]).length;document.title=(n?`(${n}) `:"")+"Motto"}
 function beep(){
   if(!S.sound)return;
   try{
@@ -1922,11 +2087,6 @@ function drawList(){
   if(S.view==="dm"){
     const t=el("span","t");t.textContent="ホーム";h.append(t);
     const ab=el("button","addbar",ic("userplus",22)+"<span>フレンドを追加</span>");ab.onclick=addFriend;l.append(ab);
-    const an=el("div","annc"+(S.chan===S.announce?" active":"")+(S.unread[S.announce]?" unread":""));
-    const at=el("span","annt");at.textContent="公式アナウンス";
-    an.append(el("span","annic",ic("speaker",22)),at);
-    if(S.ment[S.announce])an.append(badge(S.ment[S.announce]));
-    an.onclick=openAnnounce;l.append(an);
     const seg=el("div","seg");
     [["f","フレンド"],["d","DM"]].forEach(([k,tx])=>{const b=el("button",S.homeTab===k?"on":"");b.textContent=tx;b.onclick=()=>{S.homeTab=k;drawList()};seg.append(b)});
     l.append(seg);
@@ -1950,7 +2110,14 @@ function drawList(){
     const t=el("span","t");t.textContent=s.name;h.append(t,ibtn("gear","",serverMenu,"ghost sq","サーバー設定"));
     chanRows(s.channels);
   }
-  updateTitle();
+  updateAnnBtn();updateTitle();
+}
+function updateAnnBtn(){
+  const b=$("annb");if(!b)return;
+  b.classList.toggle("active",S.chan===S.announce);
+  b.querySelectorAll(".badge,.udot").forEach(x=>x.remove());
+  if(S.ment[S.announce]){const x=el("span","badge");x.textContent=S.ment[S.announce];b.append(x)}
+  else if(S.unread[S.announce])b.append(el("span","udot"));
 }
 async function drawMembers(){
   const p=$("members");p.innerHTML="";
