@@ -1263,7 +1263,7 @@ async def upload(cid: int, request: Request, name: str = "file",
 
 
 @app.get("/files/{fid}")
-async def get_file(fid: str, u=Depends(current_user)):
+async def get_file(fid: str, dl: int = 0, u=Depends(current_user)):
     r = db.execute("select channel_id,file_name,file_type from messages where file_id=?", (fid,)).fetchone()
     if not r or chan_info(u["id"], r[0]) is None or not (UPLOADS / fid).exists():
         raise HTTPException(404)
@@ -1274,7 +1274,7 @@ async def get_file(fid: str, u=Depends(current_user)):
         UPLOADS / fid,
         media_type=ftype if safe else "application/octet-stream",
         filename=r[1],
-        content_disposition_type="inline" if safe else "attachment",
+        content_disposition_type="inline" if safe and not dl else "attachment",
         headers={"X-Content-Type-Options": "nosniff"},
     )
 
@@ -1620,6 +1620,13 @@ input[type=checkbox]{width:auto}
 .addbar{width:100%;background:transparent;border:2px solid var(--acc);color:var(--acc);border-radius:16px;padding:12px;font-weight:700;margin-bottom:10px;box-shadow:0 0 16px color-mix(in srgb,var(--acc) 28%,transparent)}
 .addbar:hover{background:color-mix(in srgb,var(--acc) 12%,transparent);filter:none}
 #annb{position:relative;color:#ff9500}#annb.active{background:var(--bg4)}#annb .badge{position:absolute;top:-5px;right:-5px;font-size:10px;line-height:15px;padding:0 5px}#annb .udot{position:absolute;top:3px;right:3px;width:9px;height:9px;border-radius:50%;background:var(--bad);border:2px solid var(--bg)}
+#lb{position:fixed;inset:0;z-index:300;background:#000e;display:flex;align-items:center;justify-content:center;touch-action:none;overflow:hidden}
+#lb img,#lb video{max-width:100vw;max-height:100vh;transform-origin:center;user-select:none;-webkit-user-drag:none;touch-action:none}
+#lb img{cursor:grab}
+#lbbar{position:absolute;top:calc(10px + var(--sat));right:10px;display:flex;gap:8px;z-index:2}
+#lbbar button{background:#000b;color:#fff;border:1px solid #fff3}
+.m img.pic{cursor:zoom-in}
+.fa{display:flex;gap:6px;margin-top:4px}.fa button{background:var(--bg4);color:var(--tx2);padding:5px 10px;font-size:12px;border-radius:9px}.fa button:hover{color:var(--hi)}
 .annc{display:flex;align-items:center;gap:12px;padding:10px;border-radius:16px;background:color-mix(in srgb,#ff9500 14%,var(--bg2));border:1.5px solid #ff950099;cursor:pointer;font-weight:800;margin-bottom:10px}
 .annc.active{box-shadow:0 0 0 2px #ff9500}.annc .annt{flex:1}
 .annic{width:42px;height:42px;border-radius:12px;background:#ff9500;color:#fff;display:flex;align-items:center;justify-content:center;flex:none}
@@ -1751,6 +1758,9 @@ const IC={
  file:'<path d="M6 3h8l5 5v13H6z"/><path d="M14 3v5h5"/>',
  trash:'<path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/>',
  search:'<circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/>',
+ download:'<path d="M12 4v11M7 11l5 5 5-5M5 20h14"/>',
+ zoomin:'<circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4M11 8v6M8 11h6"/>',
+ zoomout:'<circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4M8 11h6"/>',
  logout:'<path d="M9 4H5a1 1 0 0 0-1 1v14a1 1 0 0 0 1 1h4M16 8l4 4-4 4M20 12H9"/>'
 };
 const ic=(n,s=18)=>`<svg class="svg" width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${IC[n]}</svg>`;
@@ -2194,6 +2204,41 @@ async function editMsg(m){
 async function delMsg(m){
   if(await confirmBox("このメッセージを削除しますか？","削除"))T(()=>api("/api/messages/"+m.id,"DELETE"));
 }
+const dlUrl=m=>`/files/${m.file_id}?dl=1&token=${S.token}`;
+function downloadFile(m){const a=document.createElement("a");a.href=dlUrl(m);a.download=m.file_name||"file";document.body.append(a);a.click();a.remove()}
+function closeLightbox(){const l=$("lb");if(l)l.remove();document.removeEventListener("keydown",lbKey)}
+function lbKey(e){if(e.key==="Escape")closeLightbox()}
+function openLightbox(m,url){
+  closeLightbox();
+  const L=el("div");L.id="lb";
+  const isV=(m.file_type||"").startsWith("video/");
+  const md=el(isV?"video":"img");md.src=url;
+  let sc=1,x=0,y=0;
+  const apply=()=>{md.style.transform=`translate(${x}px,${y}px) scale(${sc})`};
+  const setZ=v=>{sc=Math.min(8,Math.max(1,v));if(sc===1){x=0;y=0}apply()};
+  const bar=el("div");bar.id="lbbar";
+  if(isV){md.controls=true;md.autoplay=true;md.playsInline=true}
+  else{
+    md.alt=m.file_name||"";
+    bar.append(ibtn("zoomout","",()=>setZ(sc/1.4),"sq","縮小"),ibtn("zoomin","",()=>setZ(sc*1.4),"sq","拡大"));
+    L.addEventListener("wheel",e=>{e.preventDefault();setZ(e.deltaY<0?sc*1.15:sc/1.15)},{passive:false});
+    md.ondblclick=()=>setZ(sc>1?1:2.5);
+    md.ondragstart=e=>e.preventDefault();
+    const ptr=new Map();let d0=0,s0=1;
+    const dist=()=>{const [a,b]=[...ptr.values()];return Math.hypot(a[0]-b[0],a[1]-b[1])};
+    md.onpointerdown=e=>{md.setPointerCapture(e.pointerId);ptr.set(e.pointerId,[e.clientX,e.clientY]);if(ptr.size===2){d0=dist();s0=sc}};
+    md.onpointermove=e=>{
+      const p=ptr.get(e.pointerId);if(!p)return;
+      if(ptr.size===2){ptr.set(e.pointerId,[e.clientX,e.clientY]);if(d0)setZ(s0*dist()/d0)}
+      else{if(sc>1){x+=e.clientX-p[0];y+=e.clientY-p[1];apply()}ptr.set(e.pointerId,[e.clientX,e.clientY])}
+    };
+    md.onpointerup=md.onpointercancel=e=>{ptr.delete(e.pointerId)};
+  }
+  bar.append(ibtn("download","",()=>downloadFile(m),"sq","ダウンロード"),ibtn("x","",closeLightbox,"sq","閉じる"));
+  L.onclick=e=>{if(e.target===L)closeLightbox()};
+  L.append(md,bar);document.body.append(L);
+  document.addEventListener("keydown",lbKey);
+}
 function buildMsg(m,grouped){
   const hit=m.mentions.includes(S.me.name)||(m.reply&&m.reply.user===S.me.name);
   const d=el("div","m"+(grouped?" g":"")+(hit?" mme":""));d.dataset.mid=m.id;
@@ -2219,9 +2264,14 @@ function buildMsg(m,grouped){
   if(m.file_id){
     const url=`/files/${m.file_id}?token=${S.token}`,ty=m.file_type||"";let e;
     if(ty.startsWith("video/")){e=el("video");e.controls=true;e.preload="metadata";e.playsInline=true;e.src=url}
-    else if(ty.startsWith("image/")){e=el("img","pic");e.src=url}
-    else{e=el("a","fileln");e.href=url;e.append(ico("file",18));const s=el("span");s.textContent=m.file_name;e.append(s)}
+    else if(ty.startsWith("image/")){e=el("img","pic");e.src=url;e.title="クリックで拡大";e.onclick=()=>openLightbox(m,url)}
+    else{e=el("a","fileln");e.href=dlUrl(m);e.download=m.file_name||"file";e.append(ico("download",18));const s=el("span");s.textContent=m.file_name;e.append(s)}
     body.append(e);
+    if(ty.startsWith("video/")||ty.startsWith("image/")){
+      const fa=el("div","fa");
+      fa.append(ibtn("zoomin","拡大",()=>openLightbox(m,url),"","拡大して見る"),ibtn("download","保存",()=>downloadFile(m),"","ダウンロード"));
+      body.append(fa);
+    }
   }
   body.append(el("div","rx"));
   const act=el("div","act");
