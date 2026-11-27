@@ -52,8 +52,13 @@ UPLOADS = DATA / "uploads"
 UPLOADS.mkdir(exist_ok=True)
 MAX_STAMP = 5 * 1024 * 1024  # スタンプ画像は5MBまで (通常ファイルは無制限)
 MAX_EMOJI = 512 * 1024  # オリジナル絵文字は512KBまで
+MAX_MEDIA = 30 * 1024 * 1024  # バナー / 背景(画像・動画)は30MBまで
+MEDIA_KINDS = ("banner", "bg")
 MAX_AVATAR = 2 * 1024 * 1024  # アカウント / サーバーのアイコンは2MBまで
-OWNER_NAME = os.environ.get("OWNER_NAME", "").strip()  # 公式アナウンスを投稿できるサイトのオーナー (未設定なら最初の登録者)
+OWNER_NAME = os.environ.get("OWNER_NAME", "レンジャー").strip()  # サイトの管理者の名前 (公式アナウンスを投稿できるのはこの人だけ)
+OWNER_PASSWORD = os.environ.get("OWNER_PASSWORD", "")  # 管理者アカウントを最初に作るときのパスワード (Renderの環境変数に設定)
+if OWNER_NAME and not OWNER_PASSWORD:
+    print(f"警告: 環境変数 OWNER_PASSWORD が未設定です。他の人が先に「{OWNER_NAME}」を登録すると管理者になってしまいます。")
 MAX_CALL = 8  # 通話の最大人数 (メッシュ接続なので多すぎると重くなります)
 
 # ------------------------------------------------------------------ DB
@@ -95,6 +100,14 @@ MIGRATIONS = [  # 古いDB(v2/v3)からの移行
     ("servers", "icon_mime", "text"),
     ("servers", "icon_ver", "integer"),
     ("reactions", "ts", "real default 0"),
+    ("users", "banner_file", "text"),
+    ("users", "banner_mime", "text"),
+    ("users", "banner_ver", "integer"),
+    ("users", "banner_opacity", "integer default 100"),
+    ("users", "bg_file", "text"),
+    ("users", "bg_mime", "text"),
+    ("users", "bg_ver", "integer"),
+    ("users", "bg_opacity", "integer default 100"),
 ]
 _ID_TABLES = {"users", "servers", "roles", "channels", "messages", "stamps", "emojis"}  # id列があるテーブル
 _UPSERT = {"kv": ("k", ["v"]), "push_subs": ("endpoint", ["user_id", "sub"])}
@@ -300,7 +313,15 @@ PERM_NAMES = {
 }
 
 
+_OWNER_CACHE = {"id": None}
+
+
 def site_owner_id():
+    if OWNER_NAME:  # 名前で決まる管理者 (名前の登録は register / update_profile で保護している)
+        if _OWNER_CACHE["id"] is None:
+            x = db.execute("select id from users where name=?", (OWNER_NAME,)).fetchone()
+            _OWNER_CACHE["id"] = x[0] if x else None
+        return _OWNER_CACHE["id"]
     r = db.execute("select v from kv where k='owner_id'").fetchone()
     if r:
         return int(r[0])
@@ -342,7 +363,7 @@ def server_perms(uid, sid):
 def chan_info(uid, cid):
     """アクセスできなければ None、できれば権限ビットを返す"""
     if cid == ANNOUNCE_CID:
-        return DEFAULT if is_site_owner(uid) else P_REACT
+        return DEFAULT if is_site_owner(uid) else 0  # オーナー以外は閲覧だけ
     ch = db.execute("select server_id from channels where id=?", (cid,)).fetchone()
     if not ch:
         return None
@@ -496,12 +517,15 @@ async def register(b: dict):
         raise HTTPException(400, "パスワードは6文字以上にしてください")
     if db.execute("select 1 from users where name=?", (name,)).fetchone():
         raise HTTPException(400, "その名前は使われています")
+    if OWNER_NAME and name == OWNER_NAME and OWNER_PASSWORD and pw != OWNER_PASSWORD:
+        raise HTTPException(400, "その名前は使えません")
     salt = secrets.token_bytes(16)
     cur = db.execute(
         "insert into users(name,salt,pw,created,friend_code) values(?,?,?,?,?)",
         (name, salt, hash_pw(pw, salt), time.time(), new_friend_code()),
     )
     db.commit()
+    _OWNER_CACHE["id"] = None
     return {"token": new_session(cur.lastrowid)}
 
 
@@ -583,11 +607,17 @@ async def settings(b: dict, u=Depends(current_user)):
 @app.post("/api/profile/get")
 async def profile_get(b: dict, u=Depends(current_user)):
     r = db.execute(
-        "select id,name,bio,created,avatar_ver,avatar_file from users where name=?", (str(b.get("name", "")).strip(),)
+        "select id,name,bio,created,avatar_ver,avatar_file,banner_file,banner_mime,banner_ver,banner_opacity,"
+        "bg_file,bg_mime,bg_ver,bg_opacity from users where name=?", (str(b.get("name", "")).strip(),)
     ).fetchone()
     if not r:
         raise HTTPException(404, "ユーザーが見つかりません")
-    return {
+
+    def media(i):
+        has = bool(r[i]) and (UPLOADS / r[i]).exists()
+        return {"has": has, "mime": r[i + 1] if has else "", "v": r[i + 2] or 0, "opacity": 100 if r[i + 3] is None else r[i + 3]}
+
+    return {"banner": media(6), "bg": media(10), 
         "id": r[0], "name": r[1], "bio": r[2] or "", "created": r[3], "me": r[0] == u["id"],
         "online": bool(hub.users.get(r[0])), "avatar": r[4] if r[5] else None,
     }
@@ -601,6 +631,8 @@ async def update_profile(b: dict, u=Depends(current_user)):
         if name != u["name"]:
             if not re.fullmatch(r"[^\s@]{2,20}", name):
                 raise HTTPException(400, "名前は2〜20文字で、空白と@は使えません")
+            if OWNER_NAME and name == OWNER_NAME:
+                raise HTTPException(400, "その名前は使えません")
             if db.execute("select 1 from users where name=? and id!=?", (name, uid)).fetchone():
                 raise HTTPException(400, "その名前は使われています")
             try:
@@ -612,7 +644,15 @@ async def update_profile(b: dict, u=Depends(current_user)):
                     room[uid]["name"] = name
     if "bio" in b:
         db.execute("update users set bio=? where id=?", (str(b["bio"]).strip()[:200], uid))
+    for k in MEDIA_KINDS:
+        if f"{k}_opacity" in b:
+            try:
+                v = max(0, min(100, int(b[f"{k}_opacity"])))
+            except (TypeError, ValueError):
+                raise HTTPException(400, "不透明度が正しくありません")
+            db.execute(f"update users set {k}_opacity=? where id=?", (v, uid))
     db.commit()
+    _OWNER_CACHE["id"] = None
     for cid in [c for c, r in hub.rooms.items() if uid in r]:
         await broadcast_call(cid)
     await push(list(hub.users.keys()), {"type": "profile"})
@@ -640,6 +680,46 @@ async def delete_avatar(u=Depends(current_user)):
         (UPLOADS / old[0]).unlink(missing_ok=True)
     await push(list(hub.users.keys()), {"type": "profile"})
     return {"ok": True}
+
+
+@app.post("/api/profile/media/{kind}")
+async def set_media(kind: str, request: Request, u=Depends(current_user)):
+    if kind not in MEDIA_KINDS:
+        raise HTTPException(404)
+    fid, mime = await save_image(request, MAX_MEDIA, sniff_media)
+    old = db.execute(f"select {kind}_file from users where id=?", (u["id"],)).fetchone()
+    db.execute(f"update users set {kind}_file=?,{kind}_mime=?,{kind}_ver=? where id=?", (fid, mime, int(time.time()), u["id"]))
+    db.commit()
+    if old and old[0]:
+        (UPLOADS / old[0]).unlink(missing_ok=True)
+    await push(list(hub.users.keys()), {"type": "profile"})
+    return {"ok": True}
+
+
+@app.delete("/api/profile/media/{kind}")
+async def delete_media(kind: str, u=Depends(current_user)):
+    if kind not in MEDIA_KINDS:
+        raise HTTPException(404)
+    old = db.execute(f"select {kind}_file from users where id=?", (u["id"],)).fetchone()
+    db.execute(f"update users set {kind}_file=NULL,{kind}_mime=NULL,{kind}_ver=NULL where id=?", (u["id"],))
+    db.commit()
+    if old and old[0]:
+        (UPLOADS / old[0]).unlink(missing_ok=True)
+    await push(list(hub.users.keys()), {"type": "profile"})
+    return {"ok": True}
+
+
+@app.get("/api/profile/media")
+async def media_file(name: str, kind: str, u=Depends(current_user)):
+    if kind not in MEDIA_KINDS:
+        raise HTTPException(404)
+    r = db.execute(f"select {kind}_file,{kind}_mime from users where name=?", (name,)).fetchone()
+    if not r or not r[0] or not (UPLOADS / r[0]).exists():
+        raise HTTPException(404)
+    return FileResponse(
+        UPLOADS / r[0], media_type=r[1],
+        headers={"X-Content-Type-Options": "nosniff", "Cache-Control": "private, max-age=86400"},
+    )
 
 
 @app.get("/api/avatar")
@@ -946,7 +1026,18 @@ def sniff_image(h: bytes):
     return None
 
 
-async def save_image(request: Request, limit: int):
+def sniff_media(h: bytes):
+    m = sniff_image(h)
+    if m:
+        return m
+    if h[4:8] == b"ftyp":
+        return "video/mp4"
+    if h.startswith(b"\x1a\x45\xdf\xa3"):
+        return "video/webm"
+    return None
+
+
+async def save_image(request: Request, limit: int, sniff=None):
     fid = uuid.uuid4().hex
     path = UPLOADS / fid
     size, head = 0, b""
@@ -955,13 +1046,13 @@ async def save_image(request: Request, limit: int):
             async for chunk in request.stream():
                 size += len(chunk)
                 if size > limit:
-                    raise HTTPException(413, f"画像は{limit / 1048576:g}MBまでです")
+                    raise HTTPException(413, f"ファイルは{limit / 1048576:g}MBまでです")
                 if len(head) < 16:
                     head += chunk[: 16 - len(head)]
                 f.write(chunk)
-        mime = sniff_image(head)
+        mime = (sniff or sniff_image)(head)
         if not mime:
-            raise HTTPException(400, "png / jpg / gif / webp の画像を選んでください")
+            raise HTTPException(400, "png / jpg / gif / webp / mp4 / webm のファイルを選んでください" if sniff else "png / jpg / gif / webp の画像を選んでください")
     except BaseException:
         path.unlink(missing_ok=True)
         raise
@@ -1564,7 +1655,13 @@ input[type=checkbox]{width:auto}
 .mem{padding:6px;border-radius:10px;cursor:pointer;display:flex;align-items:center;gap:10px}.mem:hover{background:var(--bg3)}
 .mem .mi{min-width:0;display:flex;flex-direction:column}.mem small{color:var(--tx2);font-size:11px}
 .tag{font-size:10px;background:var(--grad);padding:1px 6px;border-radius:6px;margin-left:6px}
-.pf{display:flex;flex-direction:column;align-items:center;gap:8px}.pfbn{height:72px;width:100%;border-radius:14px;background:var(--grad)}
+.pf{display:flex;flex-direction:column;align-items:center;gap:8px;position:relative;isolation:isolate}.pf.hasbg{padding-bottom:12px;border-radius:14px}
+.pfbn{height:96px;width:100%;border-radius:14px;background:var(--grad);position:relative;overflow:hidden}
+.pfbg{position:absolute;inset:0;z-index:-1;border-radius:14px;overflow:hidden;background:var(--bg3)}
+.pfm{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;pointer-events:none}
+.mpv{position:relative;height:90px;border-radius:12px;overflow:hidden;background:var(--grad);display:flex;align-items:center;justify-content:center;color:#fff;font-size:13px}
+.mpv.bgp{background:var(--bg3);color:var(--tx2)}
+input[type=range]{padding:0;height:28px;accent-color:var(--acc)}
 .pf .av{margin-top:-52px;border:5px solid var(--bg2);box-sizing:content-box}.pfn{font-size:21px;font-weight:700}
 .pfb{white-space:pre-wrap;word-break:break-word;background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:12px;width:100%;min-height:64px;line-height:1.6}
 .code{background:var(--bg);padding:10px;border-radius:10px;word-break:break-all;margin:8px 0;user-select:all;font-family:ui-monospace,Consolas,monospace;font-size:13px;border:1px dashed var(--line)}
@@ -2275,10 +2372,11 @@ function buildMsg(m,grouped){
   }
   body.append(el("div","rx"));
   const act=el("div","act");
-  const sm=ibtn("smile","",()=>openPicker(sm,v=>react(m.id,v)),"","リアクション");
-  act.append(sm);
   const readOnly=S.chan===S.announce&&!S.owner;
-  if(!readOnly)act.append(ibtn("reply","",()=>setReply(m),"","返信"));
+  if(!readOnly){
+    const sm=ibtn("smile","",()=>openPicker(sm,v=>react(m.id,v)),"","リアクション");
+    act.append(sm,ibtn("reply","",()=>setReply(m),"","返信"));
+  }
   const mine=m.user===S.me.name,srv=curServer();
   if(mine&&m.text)act.append(ibtn("pencil","",()=>editMsg(m),"","編集"));
   if(mine||(S.chan===S.announce?S.owner:(srv&&srv.admin)))act.append(ibtn("trash","",()=>delMsg(m),"","削除"));
@@ -2291,7 +2389,7 @@ function renderReactions(d,r){
   for(const [e,names] of Object.entries(r)){
     const b=el("button","chip"+(names.includes(S.me.name)?" mine":""));
     b.append(emojiEl(e),document.createTextNode(" "+names.length));b.title=names.join(", ");
-    b.onclick=()=>react(Number(d.dataset.mid),e);rx.append(b);
+    b.onclick=()=>{if(!(S.chan===S.announce&&!S.owner))react(Number(d.dataset.mid),e)};rx.append(b);
   }
 }
 const react=(mid,emoji)=>wsend({type:"react",message_id:mid,emoji});
@@ -2793,13 +2891,47 @@ async function squareBlob(file,size=256){
     return await new Promise(r=>c.toBlob(r,"image/webp",.9));
   }catch(e){return file.size<=2*1024*1024?file:null}
 }
+function mkMedia(url,mime,opacity){
+  const isV=(mime||"").startsWith("video/");
+  const e=el(isV?"video":"img","pfm");
+  if(isV){e.autoplay=true;e.loop=true;e.muted=true;e.playsInline=true}else e.alt="";
+  e.src=url;e.style.opacity=(opacity==null?100:opacity)/100;e.onerror=()=>e.remove();
+  return e;
+}
+function mediaLayer(spec,name,kind){
+  if(!spec||!spec.has)return null;
+  return mkMedia(`/api/profile/media?name=${encodeURIComponent(name)}&kind=${kind}&v=${spec.v}&token=${S.token}`,spec.mime,spec.opacity);
+}
+function mediaEditor(kind,label,spec){
+  let blob=null,remove=false,mime=spec&&spec.has?spec.mime:"",url=spec&&spec.has?`/api/profile/media?name=${encodeURIComponent(S.me.name)}&kind=${kind}&v=${spec.v}&token=${S.token}`:null;
+  const w=el("div","fld"),l=el("label");l.textContent=label;
+  const box=el("div","mpv"+(kind==="bg"?" bgp":"")),op=el("input");op.type="range";op.min=0;op.max=100;op.value=spec?spec.opacity:100;
+  const ot=el("span","muted");
+  const label2=()=>{ot.textContent="不透明度 "+op.value+"%"};
+  const draw=()=>{box.innerHTML="";if(url)box.append(mkMedia(url,mime,op.value));else box.textContent="未設定";label2()};
+  op.oninput=()=>{label2();const m=box.querySelector(".pfm");if(m)m.style.opacity=op.value/100};
+  const fi=el("input");fi.type="file";fi.accept="image/png,image/jpeg,image/gif,image/webp,video/mp4,video/webm";fi.hidden=true;
+  fi.onchange=()=>{
+    const f=fi.files[0];fi.value="";if(!f)return;
+    if(f.size>30*1024*1024){toast("30MBまでのファイルを選んでください");return}
+    blob=f;remove=false;mime=f.type;url=URL.createObjectURL(f);draw();
+  };
+  const row=el("div","row");row.style.justifyContent="flex-start";
+  row.append(ibtn("plus","画像 / 動画を選ぶ",()=>fi.click(),"ghost"),ibtn("trash","削除",()=>{blob=null;remove=true;url=null;draw()},"ghost"),fi);
+  w.append(l,box,ot,op,row);draw();
+  return {node:w,opacity:()=>Number(op.value),
+    save:async()=>{if(blob)await upload(`/api/profile/media/${kind}`,blob);else if(remove)await api(`/api/profile/media/${kind}`,"DELETE")}};
+}
 async function profileModal(name){
   const p=await T(()=>api("/api/profile/get","POST",{name}));if(!p)return;
   const top=el("div","pf");
   const nm=el("div","pfn");nm.textContent=p.name;
   const st=el("div","muted");st.textContent=(p.online?"オンライン":"オフライン")+" / 登録日 "+new Date(p.created*1000).toLocaleDateString();
   const bio=el("div","pfb");bio.textContent=p.bio||"自己紹介はまだありません";if(!p.bio)bio.style.color="var(--tx2)";
-  top.append(el("div","pfbn"),avatar(p.name,"av xl"),nm,st,bio);
+  const bn=el("div","pfbn"),bm=mediaLayer(p.banner,p.name,"banner");if(bm)bn.append(bm);
+  top.append(bn,avatar(p.name,"av xl"),nm,st,bio);
+  const bgm=mediaLayer(p.bg,p.name,"bg");
+  if(bgm){const w=el("div","pfbg");w.append(bgm);top.prepend(w);top.classList.add("hasbg")}
   const act=p.me?ibtn("user","プロフィールを編集",()=>{closeModal();editProfileModal()},"btn")
                 :ibtn("send","メッセージを送る",()=>{closeModal();openDm(p.name)},"btn");
   modal("プロフィール",[top,act]);
@@ -2828,17 +2960,20 @@ async function editProfileModal(){
   l1.textContent="名前 (ログインにも使います / 2〜20文字)";ni.value=S.me.name;ni.maxLength=20;w1.append(l1,ni);
   const w2=el("div","fld"),l2=el("label"),ta=el("textarea");
   l2.textContent="自己紹介 (200文字まで)";ta.value=p.bio;ta.maxLength=200;ta.placeholder="好きなことや、ひとことをどうぞ";w2.append(l2,ta);
+  const be=mediaEditor("banner","バナー (画像・動画 / 30MBまで)",p.banner),ge=mediaEditor("bg","プロフィールの背景 (画像・動画 / 30MBまで)",p.bg);
   const go=el("button","btn","保存する");
   go.onclick=async()=>{
     try{
-      await api("/api/profile","POST",{name:ni.value.trim(),bio:ta.value.trim()});
+      toast("保存中です。動画は時間がかかることがあります");
+      await api("/api/profile","POST",{name:ni.value.trim(),bio:ta.value.trim(),banner_opacity:be.opacity(),bg_opacity:ge.opacity()});
+      await be.save();await ge.save();
       if(blob)await upload("/api/profile/avatar",blob);
       else if(remove)await api("/api/profile/avatar","DELETE");
       closeModal();toast("プロフィールを保存しました");
       await loadAvatars();await load();if(S.chan)openChan(S.chan,true);
     }catch(e){toast(e.message)}
   };
-  modal("プロフィールを編集",[prev,row,w1,w2,go]);
+  modal("プロフィールを編集",[prev,row,w1,w2,be.node,ge.node,go]);
 }
 
 applyTheme();
