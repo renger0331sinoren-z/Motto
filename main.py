@@ -1,5 +1,5 @@
 """
-MiniCord v4  (FastAPI + WebSocket + WebRTC + SQLite)
+Moot v4  (FastAPI + WebSocket + WebRTC + SQLite)
 
 主な機能
   - アカウント / フレンド(コード招待) / サーバー(作成・参加・公開検索) / ロール / DM
@@ -35,6 +35,8 @@ UPLOADS = DATA / "uploads"
 UPLOADS.mkdir(exist_ok=True)
 MAX_STAMP = 5 * 1024 * 1024  # スタンプ画像は5MBまで (通常ファイルは無制限)
 MAX_EMOJI = 512 * 1024  # オリジナル絵文字は512KBまで
+MAX_AVATAR = 2 * 1024 * 1024  # アカウント / サーバーのアイコンは2MBまで
+OWNER_NAME = os.environ.get("OWNER_NAME", "").strip()  # 公式アナウンスを投稿できるサイトのオーナー (未設定なら最初の登録者)
 MAX_CALL = 8  # 通話の最大人数 (メッシュ接続なので多すぎると重くなります)
 
 # ------------------------------------------------------------------ DB
@@ -74,9 +76,25 @@ for _t, _c, _d in [
     ("users", "friend_code", "text"),
     ("users", "notify_mode", "text default 'mention'"),
     ("servers", "is_public", "integer default 0"),
+    ("users", "bio", "text"),
+    ("users", "avatar_file", "text"),
+    ("users", "avatar_mime", "text"),
+    ("users", "avatar_ver", "integer"),
+    ("messages", "edited", "integer"),
+    ("servers", "icon_file", "text"),
+    ("servers", "icon_mime", "text"),
+    ("servers", "icon_ver", "integer"),
 ]:
     if not _has_col(_t, _c):
         db.execute(f"alter table {_t} add column {_c} {_d}")
+db.commit()
+
+# 公式アナウンス用の特別なチャンネル (全員が読めて、オーナーだけが投稿できる)
+_a = db.execute("select id from channels where kind='announce'").fetchone()
+if _a:
+    ANNOUNCE_CID = _a[0]
+else:
+    ANNOUNCE_CID = db.execute("insert into channels(server_id,name,kind) values(NULL,'公式アナウンス','announce')").lastrowid
 db.commit()
 
 # ------------------------------------------------------------------ Web Push (pywebpush が入っていれば有効)
@@ -140,6 +158,25 @@ PERM_NAMES = {
 }
 
 
+def site_owner_id():
+    r = db.execute("select v from kv where k='owner_id'").fetchone()
+    if r:
+        return int(r[0])
+    if OWNER_NAME:
+        x = db.execute("select id from users where name=?", (OWNER_NAME,)).fetchone()
+    else:
+        x = db.execute("select min(id) from users").fetchone()
+    if x and x[0] is not None:
+        db.execute("insert or replace into kv values('owner_id',?)", (str(x[0]),))
+        db.commit()
+        return x[0]
+    return None
+
+
+def is_site_owner(uid):
+    return uid == site_owner_id()
+
+
 def server_users(sid):
     return [r[0] for r in db.execute("select user_id from members where server_id=?", (sid,))]
 
@@ -162,6 +199,8 @@ def server_perms(uid, sid):
 
 def chan_info(uid, cid):
     """アクセスできなければ None、できれば権限ビットを返す"""
+    if cid == ANNOUNCE_CID:
+        return DEFAULT if is_site_owner(uid) else P_REACT
     ch = db.execute("select server_id from channels where id=?", (cid,)).fetchone()
     if not ch:
         return None
@@ -182,6 +221,8 @@ def require(uid, cid, bit=0):
 
 
 def channel_users(cid):
+    if cid == ANNOUNCE_CID:
+        return [r[0] for r in db.execute("select id from users")]
     ch = db.execute("select server_id from channels where id=?", (cid,)).fetchone()
     if not ch:
         return []
@@ -223,7 +264,14 @@ def friend_ids(uid):
 
 
 async def presence(uid, online):
-    await push(friend_ids(uid), {"type": "presence", "id": uid, "online": online})
+    ids = set(friend_ids(uid))
+    ids.update(r[0] for r in db.execute(
+        "select user_id from members where server_id in (select server_id from members where user_id=?)", (uid,)))
+    ids.update(r[0] for r in db.execute(
+        "select d2.user_id from dm_members d join dm_members d2 on d2.channel_id=d.channel_id and d2.user_id!=d.user_id "
+        "where d.user_id=?", (uid,)))
+    ids.discard(uid)
+    await push(ids, {"type": "presence", "id": uid, "online": online})
 
 
 # ------------------------------------------------------------------ 通話ルーム
@@ -248,6 +296,8 @@ async def call_leave(uid, cid):
 
 async def call_join(ws, uid, name, cid):
     require(uid, cid)
+    if cid == ANNOUNCE_CID:
+        raise HTTPException(400, "このチャンネルでは通話できません")
     ch = db.execute("select server_id,kind from channels where id=?", (cid,)).fetchone()
     if ch[0] is not None and ch[1] != "voice":
         raise HTTPException(400, "このチャンネルでは通話できません")
@@ -334,23 +384,26 @@ async def logout(request: Request, u=Depends(current_user)):
 async def me(u=Depends(current_user)):
     uid = u["id"]
     servers = []
-    for sid, name, owner, invite, pub in db.execute(
-        "select s.id,s.name,s.owner_id,s.invite,s.is_public from servers s join members m on m.server_id=s.id "
-        "where m.user_id=? order by s.id", (uid,)
+    for sid, name, owner, invite, pub, icon in db.execute(
+        "select s.id,s.name,s.owner_id,s.invite,s.is_public,case when s.icon_file is null then null else s.icon_ver end "
+        "from servers s join members m on m.server_id=s.id where m.user_id=? order by s.id", (uid,)
     ).fetchall():
         chans = [
             {"id": i, "name": n, "kind": k or "text"}
             for i, n, k in db.execute("select id,name,kind from channels where server_id=? order by id", (sid,))
         ]
-        servers.append({"id": sid, "name": name, "owner": owner == uid, "invite": invite, "public": bool(pub), "channels": chans})
-    dms = [
-        {"id": cid, "name": n}
-        for cid, n in db.execute(
-            "select c.id,(select u2.name from dm_members d2 join users u2 on u2.id=d2.user_id "
-            "where d2.channel_id=c.id and d2.user_id!=?) from channels c join dm_members d on d.channel_id=c.id "
-            "where c.server_id is null and d.user_id=? order by c.id", (uid, uid)
-        )
-    ]
+        servers.append({
+            "id": sid, "name": name, "owner": owner == uid, "admin": bool(server_perms(uid, sid) & P_ADMIN),
+            "invite": invite, "public": bool(pub), "icon": icon, "channels": chans,
+        })
+    dms = []
+    for cid, pid, pname in db.execute(
+        "select c.id,u2.id,u2.name from channels c "
+        "join dm_members d on d.channel_id=c.id and d.user_id=? "
+        "join dm_members d2 on d2.channel_id=c.id and d2.user_id!=? "
+        "join users u2 on u2.id=d2.user_id where c.server_id is null and c.kind!='announce' order by c.id", (uid, uid)
+    ):
+        dms.append({"id": cid, "name": pname, "uid": pid, "online": bool(hub.users.get(pid))})
     row = db.execute("select friend_code,notify_mode from users where id=?", (uid,)).fetchone()
     code = row[0]
     if not code:
@@ -370,6 +423,7 @@ async def me(u=Depends(current_user)):
     return {
         "user": u, "servers": servers, "dms": dms, "friend_code": code, "friends": friends, "calls": calls,
         "notify_mode": row[1] or "mention", "push_available": HAVE_PUSH,
+        "announce": ANNOUNCE_CID, "is_owner": is_site_owner(uid),
     }
 
 
@@ -381,6 +435,94 @@ async def settings(b: dict, u=Depends(current_user)):
     db.execute("update users set notify_mode=? where id=?", (mode, u["id"]))
     db.commit()
     return {"ok": True}
+
+
+# ------------------------------------------------------------------ プロフィール (アイコン / 名前 / 自己紹介)
+@app.post("/api/profile/get")
+async def profile_get(b: dict, u=Depends(current_user)):
+    r = db.execute(
+        "select id,name,bio,created,avatar_ver,avatar_file from users where name=?", (str(b.get("name", "")).strip(),)
+    ).fetchone()
+    if not r:
+        raise HTTPException(404, "ユーザーが見つかりません")
+    return {
+        "id": r[0], "name": r[1], "bio": r[2] or "", "created": r[3], "me": r[0] == u["id"],
+        "online": bool(hub.users.get(r[0])), "avatar": r[4] if r[5] else None,
+    }
+
+
+@app.post("/api/profile")
+async def update_profile(b: dict, u=Depends(current_user)):
+    uid = u["id"]
+    if "name" in b:
+        name = str(b["name"]).strip()
+        if name != u["name"]:
+            if not re.fullmatch(r"[^\s@]{2,20}", name):
+                raise HTTPException(400, "名前は2〜20文字で、空白と@は使えません")
+            if db.execute("select 1 from users where name=? and id!=?", (name, uid)).fetchone():
+                raise HTTPException(400, "その名前は使われています")
+            try:
+                db.execute("update users set name=? where id=?", (name, uid))
+            except sqlite3.IntegrityError:
+                raise HTTPException(400, "その名前は使われています")
+            for room in hub.rooms.values():
+                if uid in room:
+                    room[uid]["name"] = name
+    if "bio" in b:
+        db.execute("update users set bio=? where id=?", (str(b["bio"]).strip()[:200], uid))
+    db.commit()
+    for cid in [c for c, r in hub.rooms.items() if uid in r]:
+        await broadcast_call(cid)
+    await push(list(hub.users.keys()), {"type": "profile"})
+    return {"ok": True}
+
+
+@app.post("/api/profile/avatar")
+async def set_avatar(request: Request, u=Depends(current_user)):
+    fid, mime = await save_image(request, MAX_AVATAR)
+    old = db.execute("select avatar_file from users where id=?", (u["id"],)).fetchone()
+    db.execute("update users set avatar_file=?,avatar_mime=?,avatar_ver=? where id=?", (fid, mime, int(time.time()), u["id"]))
+    db.commit()
+    if old and old[0]:
+        (UPLOADS / old[0]).unlink(missing_ok=True)
+    await push(list(hub.users.keys()), {"type": "profile"})
+    return {"ok": True}
+
+
+@app.delete("/api/profile/avatar")
+async def delete_avatar(u=Depends(current_user)):
+    old = db.execute("select avatar_file from users where id=?", (u["id"],)).fetchone()
+    db.execute("update users set avatar_file=NULL,avatar_mime=NULL,avatar_ver=NULL where id=?", (u["id"],))
+    db.commit()
+    if old and old[0]:
+        (UPLOADS / old[0]).unlink(missing_ok=True)
+    await push(list(hub.users.keys()), {"type": "profile"})
+    return {"ok": True}
+
+
+@app.get("/api/avatar")
+async def avatar_img(name: str, u=Depends(current_user)):
+    r = db.execute("select avatar_file,avatar_mime from users where name=?", (name,)).fetchone()
+    if not r or not r[0]:
+        raise HTTPException(404)
+    return FileResponse(
+        UPLOADS / r[0], media_type=r[1],
+        headers={"X-Content-Type-Options": "nosniff", "Cache-Control": "private, max-age=86400"},
+    )
+
+
+@app.get("/api/avatars")
+async def avatars(u=Depends(current_user)):
+    """自分と、同じサーバー / DM / フレンドの人のうち、アイコンを設定している人の一覧 (名前 -> 版)"""
+    uid = u["id"]
+    rows = db.execute(
+        "select name,avatar_ver from users where avatar_file is not null and ("
+        "id=? or id in (select user_id from members where server_id in (select server_id from members where user_id=?)) "
+        "or id in (select user_id from dm_members where channel_id in (select channel_id from dm_members where user_id=?)) "
+        "or id in (select friend_id from friends where user_id=?) or id=?)",
+        (uid, uid, uid, uid, site_owner_id() or -1),
+    ).fetchall()
+    return {"avatars": {r[0]: r[1] for r in rows}}
 
 
 # ------------------------------------------------------------------ Push通知の登録
@@ -471,11 +613,12 @@ async def discover(q: str = "", u=Depends(current_user)):
     like = "%" + q.replace("%", "").replace("_", "").strip() + "%"
     rows = db.execute(
         "select s.id,s.name,(select count(*) from members m where m.server_id=s.id),"
-        "exists(select 1 from members m2 where m2.server_id=s.id and m2.user_id=?) "
+        "exists(select 1 from members m2 where m2.server_id=s.id and m2.user_id=?),"
+        "case when s.icon_file is null then null else s.icon_ver end "
         "from servers s where s.is_public=1 and s.name like ? order by 3 desc, s.id limit 50",
         (u["id"], like),
     ).fetchall()
-    return {"servers": [{"id": r[0], "name": r[1], "members": r[2], "joined": bool(r[3])} for r in rows]}
+    return {"servers": [{"id": r[0], "name": r[1], "members": r[2], "joined": bool(r[3]), "icon": r[4]} for r in rows]}
 
 
 @app.post("/api/servers/{sid}/join_public")
@@ -498,6 +641,57 @@ async def set_public(sid: int, b: dict, u=Depends(current_user)):
     db.commit()
     await push(server_users(sid), {"type": "refresh"})
     return {"ok": True}
+
+
+@app.post("/api/servers/{sid}/edit")
+async def edit_server(sid: int, b: dict, u=Depends(current_user)):
+    if not server_perms(u["id"], sid) & P_ADMIN:
+        raise HTTPException(403, "サーバーの管理者だけが変更できます")
+    name = str(b.get("name", "")).strip()[:30]
+    if not name:
+        raise HTTPException(400, "サーバー名を入力してください")
+    db.execute("update servers set name=? where id=?", (name, sid))
+    db.commit()
+    await push(server_users(sid), {"type": "refresh"})
+    return {"ok": True}
+
+
+@app.post("/api/servers/{sid}/icon")
+async def set_server_icon(sid: int, request: Request, u=Depends(current_user)):
+    if not server_perms(u["id"], sid) & P_ADMIN:
+        raise HTTPException(403, "サーバーの管理者だけが変更できます")
+    fid, mime = await save_image(request, MAX_AVATAR)
+    old = db.execute("select icon_file from servers where id=?", (sid,)).fetchone()
+    db.execute("update servers set icon_file=?,icon_mime=?,icon_ver=? where id=?", (fid, mime, int(time.time()), sid))
+    db.commit()
+    if old and old[0]:
+        (UPLOADS / old[0]).unlink(missing_ok=True)
+    await push(server_users(sid), {"type": "refresh"})
+    return {"ok": True}
+
+
+@app.delete("/api/servers/{sid}/icon")
+async def delete_server_icon(sid: int, u=Depends(current_user)):
+    if not server_perms(u["id"], sid) & P_ADMIN:
+        raise HTTPException(403, "サーバーの管理者だけが変更できます")
+    old = db.execute("select icon_file from servers where id=?", (sid,)).fetchone()
+    db.execute("update servers set icon_file=NULL,icon_mime=NULL,icon_ver=NULL where id=?", (sid,))
+    db.commit()
+    if old and old[0]:
+        (UPLOADS / old[0]).unlink(missing_ok=True)
+    await push(server_users(sid), {"type": "refresh"})
+    return {"ok": True}
+
+
+@app.get("/api/servers/{sid}/icon")
+async def server_icon(sid: int, u=Depends(current_user)):
+    r = db.execute("select icon_file,icon_mime from servers where id=?", (sid,)).fetchone()
+    if not r or not r[0]:
+        raise HTTPException(404)
+    return FileResponse(
+        UPLOADS / r[0], media_type=r[1],
+        headers={"X-Content-Type-Options": "nosniff", "Cache-Control": "private, max-age=86400"},
+    )
 
 
 @app.get("/api/servers/{sid}/members")
@@ -721,7 +915,7 @@ def valid_emoji(e: str):
 
 # ------------------------------------------------------------------ メッセージ
 MSG_SQL = (
-    "select m.id,m.channel_id,u.name,m.text,m.file_id,m.file_name,m.file_type,m.ts,m.mentions,m.stamp_id,m.reply_to "
+    "select m.id,m.channel_id,u.name,m.text,m.file_id,m.file_name,m.file_type,m.ts,m.mentions,m.stamp_id,m.reply_to,m.edited "
     "from messages m join users u on u.id=m.user_id "
 )
 
@@ -751,7 +945,7 @@ def row_to_msg(r):
     return {
         "id": r[0], "channel": r[1], "user": r[2], "text": r[3], "file_id": r[4], "file_name": r[5],
         "file_type": r[6], "ts": r[7], "mentions": json.loads(r[8]), "stamp": r[9],
-        "reply": reply_info(r[10]), "reactions": reactions_of(r[0]),
+        "reply": reply_info(r[10]), "edited": bool(r[11]), "reactions": reactions_of(r[0]),
     }
 
 
@@ -771,7 +965,9 @@ async def push_offline(cid, msg, sender_id):
     if not ch:
         return
     title = msg["user"]
-    if ch[0] is not None:
+    if cid == ANNOUNCE_CID:
+        title = "公式アナウンス"
+    elif ch[0] is not None:
         sv = db.execute("select name from servers where id=?", (ch[0],)).fetchone()
         title = f"{msg['user']} ({sv[0] if sv else ''} / {ch[1]})"
     body = (msg["text"] or "")[:120] or ("スタンプを送信しました" if msg["stamp"] else "ファイルを送信しました")
@@ -829,6 +1025,59 @@ async def get_messages(cid: int, u=Depends(current_user)):
     require(u["id"], cid)
     rows = db.execute(MSG_SQL + "where m.channel_id=? order by m.id desc limit 100", (cid,)).fetchall()
     return {"messages": [row_to_msg(r) for r in reversed(rows)]}
+
+
+@app.post("/api/messages/{mid}/edit")
+async def edit_message(mid: int, b: dict, u=Depends(current_user)):
+    r = db.execute("select channel_id,user_id,stamp_id from messages where id=?", (mid,)).fetchone()
+    if not r:
+        raise HTTPException(404, "メッセージが見つかりません")
+    if r[1] != u["id"]:
+        raise HTTPException(403, "自分のメッセージだけ編集できます")
+    require(u["id"], r[0], P_SEND)
+    if r[2]:
+        raise HTTPException(400, "スタンプは編集できません")
+    text = str(b.get("text", "")).strip()[:4000]
+    if not text:
+        raise HTTPException(400, "メッセージを入力してください")
+    db.execute(
+        "update messages set text=?, mentions=?, edited=? where id=?",
+        (text, json.dumps(find_mentions(r[0], text)), int(time.time()), mid),
+    )
+    db.commit()
+    msg = row_to_msg(db.execute(MSG_SQL + "where m.id=?", (mid,)).fetchone())
+    await push(channel_users(r[0]), {"type": "message_edit", "message": msg})
+    return {"ok": True}
+
+
+@app.delete("/api/messages/{mid}")
+async def delete_message(mid: int, u=Depends(current_user)):
+    r = db.execute("select channel_id,user_id,file_id from messages where id=?", (mid,)).fetchone()
+    if not r:
+        raise HTTPException(404, "メッセージが見つかりません")
+    cid = r[0]
+    perms = chan_info(u["id"], cid)
+    if perms is None:
+        raise HTTPException(403, "このチャンネルにアクセスできません")
+    if r[1] != u["id"]:  # 他の人のメッセージ: 公式アナウンスはオーナー、サーバーは管理者だけ。DMは不可
+        ch = db.execute("select server_id from channels where id=?", (cid,)).fetchone()
+        if cid == ANNOUNCE_CID:
+            ok = is_site_owner(u["id"])
+        elif ch and ch[0] is not None:
+            ok = bool(perms & P_ADMIN)
+        else:
+            ok = False
+        if not ok:
+            raise HTTPException(403, "このメッセージは削除できません")
+    users = channel_users(cid)
+    db.execute("delete from reactions where message_id=?", (mid,))
+    db.execute("update messages set reply_to=NULL where reply_to=?", (mid,))
+    db.execute("delete from messages where id=?", (mid,))
+    db.commit()
+    if r[2]:
+        (UPLOADS / r[2]).unlink(missing_ok=True)
+    await push(users, {"type": "message_delete", "channel": cid, "id": mid})
+    return {"ok": True}
 
 
 @app.post("/api/channels/{cid}/upload")
@@ -966,7 +1215,7 @@ async def icon_mask():
 async def manifest():
     return JSONResponse(
         {
-            "name": "MiniCord", "short_name": "MiniCord", "description": "みんなともっと楽しい時間を",
+            "name": "Moot", "short_name": "Moot", "description": "みんなともっと楽しい時間を",
             "start_url": "/", "scope": "/", "display": "standalone",
             "background_color": "#0f1015", "theme_color": "#0f1015",
             "icons": [
@@ -984,7 +1233,7 @@ self.addEventListener("install",()=>self.skipWaiting());
 self.addEventListener("activate",e=>e.waitUntil(self.clients.claim()));
 self.addEventListener("push",e=>{
   let d={};try{d=e.data.json()}catch(x){}
-  e.waitUntil(self.registration.showNotification(d.title||"MiniCord",{
+  e.waitUntil(self.registration.showNotification(d.title||"Moot",{
     body:d.body||"",icon:"/icon-192.png",badge:"/icon-192.png",tag:d.tag||"minicord",data:{channel:d.channel}}));
 });
 self.addEventListener("notificationclick",e=>{
@@ -1011,16 +1260,20 @@ PAGE = r"""<!doctype html><meta charset=utf-8>
 <meta name=theme-color content="#0f1015">
 <meta name=mobile-web-app-capable content=yes>
 <meta name=apple-mobile-web-app-capable content=yes>
-<title>MiniCord</title>
+<title>Moot</title>
+<link rel=preconnect href=https://fonts.googleapis.com><link rel=preconnect href=https://fonts.gstatic.com crossorigin>
+<link rel=stylesheet href="https://fonts.googleapis.com/css2?family=M+PLUS+Rounded+1c:wght@400;500;700;800&display=swap">
+<script>(function(){var t=localStorage.theme||"system";var l=t==="light"||(t==="system"&&matchMedia("(prefers-color-scheme: light)").matches);document.documentElement.dataset.theme=l?"light":"dark"})()</script>
 <link rel=icon type=image/png href=/icon-192.png>
 <link rel=apple-touch-icon href=/icon-192.png>
 <link rel=manifest href=/manifest.webmanifest>
 <style>
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 [hidden]{display:none!important}
-:root{--bg:#0e0f14;--bg2:#14151c;--bg3:#1a1b24;--bg4:#252633;--line:#2a2c3b;--tx:#eceef7;--tx2:#9a9eb6;
- --acc:#6b7cff;--acc2:#e86bc3;--grad:linear-gradient(135deg,#5c6ff6,#e870c2);--ok:#2fd27a;--bad:#ff5a6a;--rad:14px;
+:root{--bg:#0e0f14;--bg2:#14151c;--bg3:#1a1b24;--bg4:#252633;--line:#2a2c3b;--tx:#eceef7;--tx2:#9a9eb6;--hi:#fff;--hov:#ffffff0d;--hov2:#ffffff16;--shadow:#0008;
+ --acc:#6b7cff;--acc2:#e86bc3;--grad:linear-gradient(135deg,var(--acc),var(--acc2));--ok:#2fd27a;--bad:#ff5a6a;--rad:14px;
  --sat:env(safe-area-inset-top,0px);--sab:env(safe-area-inset-bottom,0px)}
+:root[data-theme=light]{--bg:#eceef7;--bg2:#ffffff;--bg3:#f5f6fc;--bg4:#e4e7f3;--line:#dadef0;--tx:#1b1d2b;--tx2:#656b86;--hi:#10111a;--hov:#0000000a;--hov2:#00000012;--shadow:#3a3f6a22}
 html,body{height:100%}
 body{margin:0;font-family:"Noto Sans JP","Hiragino Sans","Yu Gothic UI","Meiryo",system-ui,sans-serif;background:var(--bg);color:var(--tx);font-size:15px;overflow:hidden}
 button{font:inherit;border:0;border-radius:11px;padding:9px 14px;background:var(--acc);color:#fff;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;gap:7px;transition:filter .15s,background .15s,transform .1s}
@@ -1030,8 +1283,9 @@ button:disabled{opacity:.5;cursor:default}
 .ghost{background:var(--bg4);color:var(--tx)}
 .sq{padding:8px}
 .danger{background:var(--bad)}
-input,select{font:inherit;font-size:16px;padding:11px 13px;border:1px solid var(--line);border-radius:11px;background:var(--bg);color:var(--tx);outline:none;width:100%}
-input:focus,select:focus{border-color:var(--acc)}
+input,select,textarea{font:inherit;font-size:16px;padding:11px 13px;border:1px solid var(--line);border-radius:11px;background:var(--bg);color:var(--tx);outline:none;width:100%}
+input:focus,select:focus,textarea:focus{border-color:var(--acc)}
+textarea{resize:vertical;min-height:88px;line-height:1.5}
 input[type=checkbox]{width:auto}
 .svg{display:block;flex:none}.ico{display:inline-flex;align-items:center}
 .muted{color:var(--tx2);font-size:13px;margin:4px 0}
@@ -1042,7 +1296,7 @@ input[type=checkbox]{width:auto}
 /* ---- ログイン ---- */
 #auth{min-height:100dvh;display:flex;align-items:center;justify-content:center;padding:20px;
  background:radial-gradient(900px 500px at 15% 10%,#3b46b8 0,transparent 60%),radial-gradient(800px 500px at 90% 90%,#b4398f 0,transparent 60%),var(--bg)}
-#authbox{width:100%;max-width:360px;display:flex;flex-direction:column;gap:11px;background:rgba(20,21,28,.86);backdrop-filter:blur(14px);padding:28px;border-radius:22px;border:1px solid var(--line);box-shadow:0 20px 60px #0008}
+#authbox{width:100%;max-width:360px;display:flex;flex-direction:column;gap:11px;background:color-mix(in srgb,var(--bg2) 88%,transparent);backdrop-filter:blur(14px);padding:28px;border-radius:22px;border:1px solid var(--line);box-shadow:0 20px 60px #0008}
 #authbox .logo{width:84px;height:84px;border-radius:22px;align-self:center;box-shadow:0 8px 30px #6b7cff55}
 #authbox h1{margin:0;text-align:center;font-size:26px;letter-spacing:.5px}
 #authbox .muted{text-align:center;margin:-6px 0 4px}
@@ -1065,7 +1319,7 @@ input[type=checkbox]{width:auto}
 #list{flex:1;overflow-y:auto;padding:8px}
 .lbl{font-size:11px;color:var(--tx2);margin:12px 8px 4px;letter-spacing:.08em}
 .ch{padding:7px 9px;border-radius:10px;cursor:pointer;color:var(--tx2);display:flex;align-items:center;gap:9px;min-height:38px}
-.ch:hover{background:var(--bg3);color:var(--tx)}.ch.active{background:var(--bg4);color:#fff}.ch.unread{color:#fff;font-weight:700}
+.ch:hover{background:var(--bg3);color:var(--tx)}.ch.active{background:var(--bg4);color:var(--hi)}.ch.unread{color:var(--hi);font-weight:700}
 .ch .cn{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .ch .at{width:18px;text-align:center;font-weight:700}
 .vu{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--tx2);padding:2px 0 2px 36px}
@@ -1075,8 +1329,9 @@ input[type=checkbox]{width:auto}
 #meb{padding:10px 12px;background:var(--bg);display:flex;align-items:center;gap:10px;border-top:1px solid var(--line);padding-bottom:calc(10px + var(--sab))}
 #meinfo{flex:1;display:flex;align-items:center;gap:9px;min-width:0;font-weight:600}
 #meinfo span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.av{width:38px;height:38px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:700;color:#fff;flex:none;user-select:none}
-.av.xs{width:26px;height:26px;font-size:12px}.av.sm2{width:32px;height:32px;font-size:14px}.av.lg{width:64px;height:64px;font-size:26px}
+.av{width:38px;height:38px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:700;color:#fff;flex:none;user-select:none;position:relative;overflow:hidden}
+.av.xs{width:26px;height:26px;font-size:12px}.av.sm2{width:32px;height:32px;font-size:14px}.av.lg{width:64px;height:64px;font-size:26px}.av.xl{width:96px;height:96px;font-size:38px}
+.av img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}.av.hasimg{color:transparent;background:var(--bg4)!important}
 
 #main{flex:1;display:flex;flex-direction:column;min-width:0;background:var(--bg3)}
 #head{padding:calc(10px + var(--sat)) 14px 10px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:10px;min-height:56px;background:var(--bg3)}
@@ -1106,28 +1361,28 @@ input[type=checkbox]{width:auto}
 .empty{height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;color:var(--tx2);text-align:center;padding:20px}
 .empty img{width:96px;height:96px;border-radius:24px;box-shadow:0 10px 40px #6b7cff44}
 .m{display:flex;gap:12px;padding:3px 8px;border-radius:12px;position:relative}
-.m:not(.g){margin-top:12px}.m:hover{background:#ffffff08}
+.m:not(.g){margin-top:12px}.m:hover{background:var(--hov)}
 .m.mme{background:#f0b23218;box-shadow:inset 3px 0 0 #f0b232}
 .m.flash{background:#6b7cff30}
 .ms{width:40px;flex:none;display:flex;justify-content:center}
 .gt{font-size:10px;color:transparent;padding-top:4px}.m:hover .gt{color:var(--tx2)}
 .mb{min-width:0;flex:1}
-.mh2{display:flex;align-items:baseline;gap:8px}.mh2 b{color:#fff}.mh2 small{color:var(--tx2);font-size:11px}
+.mh2{display:flex;align-items:baseline;gap:8px}.mh2 b{color:var(--hi)}.mh2 small{color:var(--tx2);font-size:11px}
 .mt{white-space:pre-wrap;word-break:break-word;line-height:1.55}
 .mt.jumbo .cemoji{width:48px;height:48px}
 .ref{display:flex;align-items:center;gap:6px;font-size:13px;color:var(--tx2);cursor:pointer;margin-bottom:2px;overflow:hidden;white-space:nowrap}
-.ref b{color:#cfd3ee}.ref span{overflow:hidden;text-overflow:ellipsis}.ref:hover{color:var(--tx)}
+.ref b{color:var(--tx)}.ref span{overflow:hidden;text-overflow:ellipsis}.ref:hover{color:var(--tx)}
 .m video,.m img.pic{max-width:min(420px,100%);max-height:320px;display:block;margin-top:6px;border-radius:12px}
 .m img.stamp{max-width:150px;max-height:150px;display:block;margin-top:4px}
-.fileln{display:inline-flex;align-items:center;gap:8px;margin-top:6px;padding:8px 12px;background:var(--bg4);border-radius:10px;color:#9db4ff;text-decoration:none}
-.mention{background:#6b7cff33;color:#c7cdff;border-radius:5px;padding:0 3px}.mention.me{background:var(--acc);color:#fff}
+.fileln{display:inline-flex;align-items:center;gap:8px;margin-top:6px;padding:8px 12px;background:var(--bg4);border-radius:10px;color:var(--acc);text-decoration:none}
+.mention{background:#6b7cff33;color:var(--acc);border-radius:5px;padding:0 3px}.mention.me{background:var(--acc);color:#fff}
 .cemoji{width:22px;height:22px;object-fit:contain;vertical-align:middle}
 .uemoji{font-family:"Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",sans-serif}
 .rx{display:flex;gap:5px;flex-wrap:wrap;margin-top:5px}.rx:empty{display:none}
 .chip{background:var(--bg4);border:1px solid transparent;padding:2px 9px;font-size:13px;border-radius:12px;color:var(--tx)}
 .chip.mine{border-color:var(--acc);background:#6b7cff2a}
 .act{position:absolute;top:-14px;right:10px;display:none;gap:2px;background:var(--bg4);border:1px solid var(--line);border-radius:11px;padding:2px}
-.act button{background:none;padding:6px;color:var(--tx2)}.act button:hover{color:#fff;background:var(--bg3)}
+.act button{background:none;padding:6px;color:var(--tx2)}.act button:hover{color:var(--hi);background:var(--bg3)}
 .m:hover .act{display:flex}
 #prog{font-size:12px;padding:0 16px;height:14px;color:var(--tx2)}
 #replybar{margin:0 12px;padding:8px 12px;background:var(--bg4);border-radius:12px 12px 0 0;display:flex;align-items:center;gap:8px;font-size:13px;color:var(--tx2)}
@@ -1138,13 +1393,16 @@ input[type=checkbox]{width:auto}
 #bar{display:flex;align-items:center;gap:8px;padding:10px 12px calc(12px + var(--sab));background:var(--bg3)}
 #bar .field{flex:1;display:flex;align-items:center;background:var(--bg4);border-radius:16px;padding:0 4px}
 #txt{background:transparent;border:0;padding:12px 10px}
-#bar .ghost{background:transparent;color:var(--tx2)}#bar .ghost:hover{color:#fff;background:#ffffff12}
+#bar .ghost{background:transparent;color:var(--tx2)}#bar .ghost:hover{color:var(--hi);background:var(--hov2)}
 #bsend{border-radius:14px;padding:11px 16px}
 #members{width:236px;background:var(--bg2);padding:14px;overflow-y:auto;border-left:1px solid var(--line);flex:none}
 #members h4{margin:0 0 8px;font-size:12px;color:var(--tx2);letter-spacing:.08em}
 .mem{padding:6px;border-radius:10px;cursor:pointer;display:flex;align-items:center;gap:10px}.mem:hover{background:var(--bg3)}
 .mem .mi{min-width:0;display:flex;flex-direction:column}.mem small{color:var(--tx2);font-size:11px}
 .tag{font-size:10px;background:var(--grad);padding:1px 6px;border-radius:6px;margin-left:6px}
+.pf{display:flex;flex-direction:column;align-items:center;gap:8px}.pfbn{height:72px;width:100%;border-radius:14px;background:var(--grad)}
+.pf .av{margin-top:-52px;border:5px solid var(--bg2);box-sizing:content-box}.pfn{font-size:21px;font-weight:700}
+.pfb{white-space:pre-wrap;word-break:break-word;background:var(--bg);border:1px solid var(--line);border-radius:12px;padding:12px;width:100%;min-height:64px;line-height:1.6}
 .code{background:var(--bg);padding:10px;border-radius:10px;word-break:break-all;margin:8px 0;user-select:all;font-family:ui-monospace,Consolas,monospace;font-size:13px;border:1px dashed var(--line)}
 
 /* ---- モーダル / トースト / 絵文字ピッカー ---- */
@@ -1153,14 +1411,14 @@ input[type=checkbox]{width:auto}
 .mh{display:flex;align-items:center;justify-content:space-between;font-size:17px}
 .fld{display:flex;flex-direction:column;gap:6px}.fld label{font-size:13px;color:var(--tx2)}
 .chk{display:flex!important;align-items:center;gap:9px;color:var(--tx)!important;font-size:14px!important}
-.tabs{display:flex;gap:6px;background:var(--bg);padding:4px;border-radius:12px}.tabs button{flex:1;background:transparent;color:var(--tx2)}.tabs button.on{background:var(--bg4);color:#fff}
+.tabs{display:flex;gap:6px;background:var(--bg);padding:4px;border-radius:12px}.tabs button{flex:1;background:transparent;color:var(--tx2)}.tabs button.on{background:var(--bg4);color:var(--hi)}
 .mi{justify-content:flex-start;background:var(--bg3);color:var(--tx);width:100%;padding:12px 14px}
 .drow{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px;background:var(--bg3);border-radius:12px}
 .drow small{display:block;color:var(--tx2)}.dlist{display:flex;flex-direction:column;gap:8px;max-height:46vh;overflow-y:auto}
 .pv{max-width:120px;max-height:120px;align-self:center;border-radius:12px;background:var(--bg)}
 #toast{position:fixed;left:50%;bottom:calc(86px + var(--sab));transform:translateX(-50%);background:#000d;color:#fff;padding:11px 18px;border-radius:14px;z-index:200;max-width:90vw;text-align:center;border:1px solid var(--line)}
 .pk{position:fixed;z-index:150;width:330px;background:var(--bg2);border:1px solid var(--line);border-radius:16px;box-shadow:0 20px 60px #000a;display:flex;flex-direction:column}
-.pktabs{display:flex;gap:2px;padding:8px 8px 0;overflow-x:auto}.pktabs button{background:transparent;color:var(--tx2);padding:6px 10px;font-size:12px;border-radius:9px;white-space:nowrap}.pktabs button.on{background:var(--bg4);color:#fff}
+.pktabs{display:flex;gap:2px;padding:8px 8px 0;overflow-x:auto}.pktabs button{background:transparent;color:var(--tx2);padding:6px 10px;font-size:12px;border-radius:9px;white-space:nowrap}.pktabs button.on{background:var(--bg4);color:var(--hi)}
 .pkgrid{display:flex;flex-wrap:wrap;gap:2px;padding:8px;height:230px;overflow-y:auto;align-content:flex-start}
 .pe{background:transparent;padding:4px;font-size:24px;width:40px;height:40px;border-radius:10px}.pe:hover{background:var(--bg4)}
 .pe .cemoji{width:28px;height:28px}
@@ -1190,12 +1448,45 @@ input[type=checkbox]{width:auto}
  #mbox{max-height:92vh;border-radius:20px 20px 16px 16px}
  #stampbox{margin:0 8px}#replybar{margin:0 8px}
 }
+
+/* ---- ステータス丸 / ホーム画面 / 公式アナウンス ---- */
+.avw{position:relative;flex:none;display:inline-flex}
+.sdot{position:absolute;right:-2px;bottom:-2px;width:13px;height:13px;border-radius:50%;background:#9aa0b4;border:2.5px solid var(--bg2);box-sizing:border-box}
+.sdot.on{background:var(--ok);box-shadow:0 0 8px var(--ok)}
+.addbar{width:100%;background:transparent;border:2px solid var(--acc);color:var(--acc);border-radius:16px;padding:12px;font-weight:700;margin-bottom:10px;box-shadow:0 0 16px color-mix(in srgb,var(--acc) 28%,transparent)}
+.addbar:hover{background:color-mix(in srgb,var(--acc) 12%,transparent);filter:none}
+.annc{display:flex;align-items:center;gap:12px;padding:10px;border-radius:16px;background:color-mix(in srgb,#ff9500 14%,var(--bg2));border:1.5px solid #ff950099;cursor:pointer;font-weight:800;margin-bottom:10px}
+.annc.active{box-shadow:0 0 0 2px #ff9500}.annc .annt{flex:1}
+.annic{width:42px;height:42px;border-radius:12px;background:#ff9500;color:#fff;display:flex;align-items:center;justify-content:center;flex:none}
+.seg{display:flex;background:var(--bg4);border-radius:15px;padding:4px;margin-bottom:8px}
+.seg button{flex:1;background:transparent;color:var(--tx2);font-weight:800;border-radius:12px;padding:10px}
+.seg button.on{background:var(--bg2);color:var(--acc);box-shadow:0 2px 8px var(--shadow)}
+.frow{display:flex;align-items:center;gap:13px;padding:8px;border-radius:14px;cursor:pointer}
+.frow:hover{background:var(--hov)}.frow .fn{flex:1;font-size:16px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.frow.off .fn{opacity:.6}.frow.unread .fn{text-decoration:underline}
+.mem.off .mi span{opacity:.6}
+.edited{font-size:10px;color:var(--tx2);margin-left:6px}
+.pvc{display:flex;justify-content:center;padding:4px 0}
+.swatches{display:flex;gap:8px;flex-wrap:wrap}.swt{width:34px;height:34px;border-radius:50%;padding:0;border:2px solid var(--line)}
+input[type=color]{padding:3px;height:44px}
+/* ---- ポップな文字 (写真のスタイル) ---- */
+body.pop{font-family:"M PLUS Rounded 1c","Hiragino Maru Gothic ProN","Yu Gothic UI","Meiryo",system-ui,sans-serif}
+body.pop .fn,body.pop .cn,body.pop .mh2 b,body.pop .pfn,body.pop #meinfo span,body.pop .mem .mi>span,body.pop .annt,body.pop #sidehead .t,body.pop #headt{font-weight:800}
+body.pop .fn,body.pop .mh2 b,body.pop .pfn,body.pop #meinfo span,body.pop .mem .mi>span{color:var(--acc);text-shadow:0 0 12px color-mix(in srgb,var(--acc) 40%,transparent)}
+body.pop .annt{color:#ff9500}
+/* ---- 通話の拡大表示 ---- */
+#call.big{position:fixed;inset:0;z-index:70;max-height:none;display:flex;flex-direction:column;padding:calc(12px + var(--sat)) 16px calc(16px + var(--sab));background:var(--bg)}
+#call.big #tiles{flex:1;min-height:0;grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr));grid-auto-rows:minmax(0,1fr)}
+#call.big .tile{aspect-ratio:auto;min-height:0}
+#call.big .tile.screen{max-height:none;grid-column:1/-1;aspect-ratio:auto}
+#call.big #ctl{padding-top:12px}
+@media(max-width:820px){#call.big #tiles{grid-template-columns:repeat(auto-fit,minmax(min(100%,150px),1fr))}}
 </style>
 
 <div id=auth>
  <div id=authbox>
   <img class=logo src=/icon-192.png alt="">
-  <h1>MiniCord</h1>
+  <h1>Moot</h1>
   <p class=muted>みんなともっと楽しい時間を</p>
   <input id=an placeholder="ユーザー名" autocomplete=username>
   <input id=ap type=password placeholder="パスワード (6文字以上)" autocomplete=current-password>
@@ -1230,12 +1521,14 @@ input[type=checkbox]{width:auto}
     <button id=camb onclick="toggleCam()"></button>
     <button id=flipb class=wide onclick="switchCam()" hidden></button>
     <button id=scrb onclick="toggleScreen()" hidden></button>
+    <button id=bigb onclick="toggleBig()"></button>
     <button id=hangb class=hang onclick="leaveCall()"></button>
    </div>
   </div>
   <div id=msgs></div><div id=prog></div>
   <div id=replybar hidden></div>
   <div id=stampbox hidden></div>
+  <div id=ronote class=muted hidden style="text-align:center;padding:14px">公式アナウンスはオーナーだけが投稿できます</div>
   <div id=bar>
    <button id=bclip class=ghost onclick="f.click()"></button>
    <button id=bstamp class=ghost onclick="toggleStamps()"></button>
@@ -1279,6 +1572,11 @@ const IC={
  gear:'<circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3M5 5l2 2M17 17l2 2M19 5l-2 2M7 17l-2 2"/>',
  x:'<path d="M6 6l12 12M18 6L6 18"/>',
  users:'<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0M16 4.5a3.5 3.5 0 0 1 0 7M18 14a6.5 6.5 0 0 1 3.5 6"/>',
+ user:'<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>',
+ pencil:'<path d="M4 20l4-1L19 8l-3-3L5 16z"/><path d="M14 7l3 3"/>',
+ expand:'<path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/>',
+ compress:'<path d="M9 4v5H4M15 4v5h5M9 20v-5H4M15 20v-5h5"/>',
+ more:'<path d="M5 12h.01M12 12h.01M19 12h.01"/>',
  userplus:'<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20a6.5 6.5 0 0 1 13 0M19 8v6M16 11h6"/>',
  copy:'<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V6a2 2 0 0 1 2-2h8"/>',
  shield:'<path d="M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z"/>',
@@ -1299,15 +1597,24 @@ function ibtn(n,label,fn,cls="",title=""){
   return b;
 }
 const AVC=["#5c6ff6","#8b5cf6","#d946ef","#ec4899","#f97316","#14b8a6","#22a559","#0ea5e9"];
+function colorOf(name){let h=0;for(const c of name)h=(h*31+c.charCodeAt(0))>>>0;return AVC[h%AVC.length]}
+function statusAvatar(name,cls,online){
+  const w=el("div","avw");w.append(avatar(name,cls),el("span","sdot"+(online?" on":"")));return w;
+}
 function avatar(name,cls="av"){
-  let h=0;for(const c of name)h=(h*31+c.charCodeAt(0))>>>0;
-  const a=el("div",cls);a.textContent=name.slice(0,1).toUpperCase();a.style.background=AVC[h%AVC.length];return a;
+  const a=el("div",cls);a.textContent=name.slice(0,1).toUpperCase();a.style.background=colorOf(name);
+  const v=S.av[name];
+  if(v){
+    const i=el("img");i.alt="";i.onload=()=>a.classList.add("hasimg");i.onerror=()=>i.remove();
+    i.src=`/api/avatar?name=${encodeURIComponent(name)}&v=${v}&token=${S.token}`;a.append(i);
+  }
+  return a;
 }
 const hhmm=t=>new Date(t*1000).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit"});
 const fullTime=t=>new Date(t*1000).toLocaleString([],{month:"numeric",day:"numeric",hour:"2-digit",minute:"2-digit"});
 
 /* ---------- 状態 ---------- */
-const S={token:localStorage.token||"",me:null,servers:[],dms:[],friends:[],code:"",calls:{},stamps:[],emojis:[],emap:{},
+const S={token:localStorage.token||"",me:null,servers:[],dms:[],friends:[],code:"",calls:{},stamps:[],emojis:[],emap:{},av:{},announce:0,owner:false,homeTab:"f",callBig:false,
  view:"dm",chan:null,unread:{},ment:{},ws:null,reply:null,notify:"mention",push:false,sound:localStorage.sound!=="0"};
 let call=null,toastT=0,modalCancel=null,last=null;
 const coarse=matchMedia("(pointer:coarse)").matches;
@@ -1405,16 +1712,16 @@ async function logout(){
 async function load(){
   const d=await api("/api/me");
   S.me=d.user;S.servers=d.servers;S.dms=d.dms;S.friends=d.friends;S.code=d.friend_code;S.calls=d.calls||{};
-  S.notify=d.notify_mode;S.push=d.push_available;
+  S.notify=d.notify_mode;S.push=d.push_available;S.announce=d.announce;S.owner=d.is_owner;
   if(S.view!=="dm"&&!S.servers.find(s=>s.id===S.view))S.view="dm";
-  const mi=$("meinfo");mi.innerHTML="";const nm=el("span");nm.textContent=S.me.name;mi.append(avatar(S.me.name,"av sm2"),nm);
+  const mi=$("meinfo");mi.innerHTML="";const nm=el("span");nm.textContent=S.me.name;mi.append(avatar(S.me.name,"av sm2"),nm);mi.style.cursor="pointer";mi.onclick=()=>profileModal(S.me.name);
   drawRail();drawList();drawMembers();drawRing();updateCallBtn();drawNbar();
 }
 async function boot(){
   try{await load()}catch(e){localStorage.removeItem("token");S.token="";$("auth").hidden=false;$("app").hidden=true;return}
   $("auth").hidden=true;$("app").hidden=false;
   connect();
-  await Promise.all([loadStamps(),loadEmojis()]);
+  await Promise.all([loadStamps(),loadEmojis(),loadAvatars()]);
   setView("dm");
   const c=Number(new URLSearchParams(location.search).get("c"));if(c)goChannel(c);
   ensurePush();
@@ -1447,10 +1754,20 @@ function onEvent(e){
     const x=document.querySelector(`[data-mid="${d.message_id}"]`);if(x)renderReactions(x,d.reactions);
   }else if(d.type==="refresh"){load().catch(()=>{})}
   else if(d.type==="presence"){
-    const f=S.friends.find(x=>x.id===d.id);if(f){f.online=d.online;if(S.view==="dm")drawList()}
-    if(S.view!=="dm")drawMembers();
+    const f=S.friends.find(x=>x.id===d.id);if(f)f.online=d.online;
+    S.dms.forEach(x=>{if(x.uid===d.id)x.online=d.online});
+    if(S.view==="dm")drawList();else drawMembers();
   }
   else if(d.type==="stamps"){loadStamps()}
+  else if(d.type==="message_edit"){
+    const m=d.message,old=document.querySelector(`[data-mid="${m.id}"]`);
+    if(old)old.replaceWith(buildMsg(m,old.classList.contains("g")));
+  }
+  else if(d.type==="message_delete"){
+    const x=document.querySelector(`[data-mid="${d.id}"]`);
+    if(x){const nx=x.nextElementSibling,again=!x.classList.contains("g")&&nx&&nx.classList.contains("g");x.remove();if(again&&S.chan===d.channel)openChan(S.chan,true)}
+  }
+  else if(d.type==="profile"){loadAvatars().then(()=>{load().catch(()=>{});if(S.chan)openChan(S.chan,true)})}
   else if(d.type==="emojis"){loadEmojis().then(()=>{if(S.chan)openChan(S.chan,true)})}
   else if(d.type==="call_peers"){onPeers(d)}
   else if(d.type==="call_state"){onCallState(d)}
@@ -1460,7 +1777,7 @@ function onEvent(e){
 window.addEventListener("focus",()=>{if(S.chan){S.unread[S.chan]=0;S.ment[S.chan]=0;if(S.me)drawList()}});
 
 /* ---------- 通知 ---------- */
-function updateTitle(){const n=Object.keys(S.unread).filter(k=>S.unread[k]).length;document.title=(n?`(${n}) `:"")+"MiniCord"}
+function updateTitle(){const n=Object.keys(S.unread).filter(k=>S.unread[k]).length;document.title=(n?`(${n}) `:"")+"Moot"}
 function beep(){
   if(!S.sound)return;
   try{
@@ -1548,9 +1865,10 @@ function setView(v,cid){
   const l=chanList();
   const t=cid&&l.some(c=>c.id===cid)?cid:(l[0]&&l[0].id);
   if(t)openChan(t,true);
-  else{S.chan=null;last=null;clearReply();$("headt").textContent=v==="dm"?"ホーム":"";updateCallBtn();emptyState()}
+  else{S.chan=null;last=null;clearReply();$("bar").hidden=false;$("ronote").hidden=true;$("headt").textContent=v==="dm"?"ホーム":"";updateCallBtn();emptyState()}
 }
 function goChannel(cid){
+  if(cid===S.announce){openAnnounce();return}
   if(S.dms.some(c=>c.id===cid))return setView("dm",cid);
   const s=S.servers.find(s=>s.channels.some(c=>c.id===cid));if(s)setView(s.id,cid);
 }
@@ -1565,38 +1883,35 @@ function drawRail(){
   const mk=(inner,title,fn,cls)=>{const b=el("button","rb "+cls,inner);b.title=title;b.onclick=fn;r.append(b);return b};
   mk('<img src="/icon-192.png" alt="">',"ホーム",()=>setView("dm"),"home"+(S.view==="dm"?" active":""));
   r.append(el("div","sep"));
-  S.servers.forEach(s=>{const b=mk("",s.name,()=>setView(s.id),S.view===s.id?"active":"");b.textContent=s.name.slice(0,2)});
+  S.servers.forEach(s=>{
+    const b=mk("",s.name,()=>setView(s.id),S.view===s.id?"active":"");
+    if(s.icon){const i=el("img");i.alt="";i.src=`/api/servers/${s.id}/icon?v=${s.icon}&token=${S.token}`;b.append(i)}
+    else b.textContent=s.name.slice(0,2);
+  });
   mk(ic("plus",24),"サーバーを作成 / 参加",addServerModal,"green");
   mk(ic("compass",24),"サーバーを探す",discoverModal,"green");
 }
+const mitem=(icon,label,fn)=>{const b=el("button","mi ghost",ic(icon)+`<span>${label}</span>`);b.onclick=()=>{closeModal();fn()};return b};
+function friendMenu(f){
+  modal(f.name,[
+    mitem("user","プロフィールを見る",()=>profileModal(f.name)),
+    mitem("send","メッセージを送る",()=>openDm(f.name)),
+    mitem("trash","フレンドを削除",async()=>{if(await confirmBox(f.name+" をフレンドから削除しますか？","削除"))T(()=>api("/api/friends/remove","POST",{id:f.id}))})
+  ]);
+}
+function openAnnounce(){S.view="dm";drawRail();drawMembers();openChan(S.announce)}
 function drawList(){
   const h=$("sidehead"),l=$("list");h.innerHTML="";l.innerHTML="";
-  const lbl=t=>{const x=el("div","lbl");x.textContent=t;l.append(x)};
-  if(S.view==="dm"){
-    const t=el("span","t");t.textContent="ホーム";h.append(t,ibtn("userplus","",addFriend,"ghost sq","フレンドを追加"));
-    lbl("フレンド  "+S.friends.length);
-    S.friends.forEach(f=>{
-      const d=el("div","ch");const a=avatar(f.name,"av xs");
-      const dot=el("span","dot"+(f.online?" on":""));
-      const n=el("span","cn");n.textContent=f.name;
-      d.append(a,n,dot);
-      d.onclick=()=>openDm(f.name);
-      const x=ibtn("x","",e=>{e.stopPropagation();confirmBox(f.name+" をフレンドから削除しますか？","削除").then(ok=>{if(ok)T(()=>api("/api/friends/remove","POST",{id:f.id}))})},"xb","フレンドを削除");
-      d.append(x);l.append(d);
-    });
-    lbl("ダイレクトメッセージ");
-  }else{
-    const s=curServer();if(!s)return;
-    const t=el("span","t");t.textContent=s.name;h.append(t,ibtn("gear","",serverMenu,"ghost sq","サーバー設定"));
-  }
-  chanList().forEach(c=>{
+  const badge=n=>{const b=el("span","badge");b.textContent=n;return b};
+  const hint=t=>{const p=el("p","muted");p.textContent=t;l.append(p)};
+  const chanRows=list=>list.forEach(c=>{
     const wrap=el("div");
     const d=el("div","ch"+(c.id===S.chan?" active":"")+(S.unread[c.id]?" unread":""));
-    const lead=S.view==="dm"?avatar(c.name,"av xs"):ico(c.kind==="voice"?"speaker":"hash",18);
+    const lead=S.view==="dm"?statusAvatar(c.name,"av xs",c.online):ico(c.kind==="voice"?"speaker":"hash",18);
     const n=el("span","cn");n.textContent=c.name;d.append(lead,n);
     const cu=S.calls[c.id]||[];
     if(S.view==="dm"&&cu.length)d.append(ico("phone",15));
-    if(S.ment[c.id]){const b=el("span","badge");b.textContent=S.ment[c.id];d.append(b)}
+    if(S.ment[c.id])d.append(badge(S.ment[c.id]));
     d.onclick=()=>openChan(c.id);wrap.append(d);
     if(c.kind==="voice")cu.forEach(u=>{
       const v=el("div","vu");v.append(avatar(u.name,"av xs"));if(!u.mic)v.append(ico("micoff",13));
@@ -1604,6 +1919,37 @@ function drawList(){
     });
     l.append(wrap);
   });
+  if(S.view==="dm"){
+    const t=el("span","t");t.textContent="ホーム";h.append(t);
+    const ab=el("button","addbar",ic("userplus",22)+"<span>フレンドを追加</span>");ab.onclick=addFriend;l.append(ab);
+    const an=el("div","annc"+(S.chan===S.announce?" active":"")+(S.unread[S.announce]?" unread":""));
+    const at=el("span","annt");at.textContent="公式アナウンス";
+    an.append(el("span","annic",ic("speaker",22)),at);
+    if(S.ment[S.announce])an.append(badge(S.ment[S.announce]));
+    an.onclick=openAnnounce;l.append(an);
+    const seg=el("div","seg");
+    [["f","フレンド"],["d","DM"]].forEach(([k,tx])=>{const b=el("button",S.homeTab===k?"on":"");b.textContent=tx;b.onclick=()=>{S.homeTab=k;drawList()};seg.append(b)});
+    l.append(seg);
+    if(S.homeTab==="f"){
+      if(!S.friends.length)hint("まだフレンドがいません。上のボタンからフレンドコードで追加できます。");
+      S.friends.forEach(f=>{
+        const dm=S.dms.find(x=>x.uid===f.id);
+        const row=el("div","frow"+(f.online?"":" off")+(dm&&S.unread[dm.id]?" unread":""));
+        const n=el("span","fn");n.textContent=f.name;
+        row.append(statusAvatar(f.name,"av",f.online),n);
+        if(dm&&S.ment[dm.id])row.append(badge(S.ment[dm.id]));
+        row.append(ibtn("more","",e=>{e.stopPropagation();friendMenu(f)},"xb","メニュー"));
+        row.onclick=()=>openDm(f.name);l.append(row);
+      });
+    }else{
+      if(!S.dms.length)hint("DMはまだありません。フレンドを選んでメッセージを送ってみよう。");
+      chanRows(S.dms);
+    }
+  }else{
+    const s=curServer();if(!s)return;
+    const t=el("span","t");t.textContent=s.name;h.append(t,ibtn("gear","",serverMenu,"ghost sq","サーバー設定"));
+    chanRows(s.channels);
+  }
   updateTitle();
 }
 async function drawMembers(){
@@ -1622,13 +1968,13 @@ async function drawMembers(){
   if(sid!==S.view)return;
   const h=el("h4");h.textContent="メンバー  "+d.members.length;p.append(h);
   d.members.forEach(m=>{
-    const e=el("div","mem");e.append(avatar(m.name,"av sm2"));
+    const e=el("div","mem"+(m.online?"":" off"));e.append(statusAvatar(m.name,"av sm2",m.online));
     const i=el("div","mi"),n=el("span");n.textContent=m.name;
     if(m.owner)n.append(el("span","tag","オーナー"));
     i.append(n);
     if(m.roles.length){const r=el("small");r.textContent=m.roles.join(", ");i.append(r)}
-    e.append(i,el("span","dot"+(m.online?" on":"")));
-    if(m.id!==S.me.id)e.onclick=()=>{closeDrawers();openDm(m.name)};
+    e.append(i);
+    e.onclick=()=>{closeDrawers();profileModal(m.name)};
     p.append(e);
   });
 }
@@ -1636,9 +1982,11 @@ async function openChan(cid,auto){
   S.chan=cid;S.unread[cid]=0;S.ment[cid]=0;last=null;clearReply();
   if(!auto)closeDrawers();
   drawList();
-  const c=chanList().find(x=>x.id===cid);
+  const isA=cid===S.announce;
+  const c=isA?{name:"公式アナウンス",kind:"announce"}:chanList().find(x=>x.id===cid);
   const ht=$("headt");ht.innerHTML="";
-  if(c)ht.append(S.view==="dm"?el("span","at","@"):ico(c.kind==="voice"?"speaker":"hash",19),document.createTextNode(c.name));
+  if(c)ht.append((isA||c.kind==="voice")?ico("speaker",19):(S.view==="dm"?el("span","at","@"):ico("hash",19)),document.createTextNode(c.name));
+  const ro=isA&&!S.owner;$("bar").hidden=ro;$("ronote").hidden=!ro;$("stampbox").hidden=true;
   updateCallBtn();
   $("msgs").innerHTML="";
   const d=await T(()=>api(`/api/channels/${cid}/messages`));
@@ -1668,12 +2016,23 @@ function jumpTo(id){
   else toast("元のメッセージは読み込まれていません");
 }
 function addMsg(m){
-  const hit=m.mentions.includes(S.me.name)||(m.reply&&m.reply.user===S.me.name);
   const grouped=!!(last&&last.chan===m.channel&&last.user===m.user&&m.ts-last.ts<300&&!m.reply);
   last={user:m.user,ts:m.ts,chan:m.channel};
+  $("msgs").append(buildMsg(m,grouped));
+}
+async function editMsg(m){
+  const f=await form("メッセージを編集",[{k:"text",label:"メッセージ",value:m.text}],"保存する");
+  if(f&&f.text&&f.text!==m.text)T(()=>api(`/api/messages/${m.id}/edit`,"POST",{text:f.text}));
+}
+async function delMsg(m){
+  if(await confirmBox("このメッセージを削除しますか？","削除"))T(()=>api("/api/messages/"+m.id,"DELETE"));
+}
+function buildMsg(m,grouped){
+  const hit=m.mentions.includes(S.me.name)||(m.reply&&m.reply.user===S.me.name);
   const d=el("div","m"+(grouped?" g":"")+(hit?" mme":""));d.dataset.mid=m.id;
   const side=el("div","ms");
-  if(grouped){const g=el("span","gt");g.textContent=hhmm(m.ts);side.append(g)}else side.append(avatar(m.user));
+  if(grouped){const g=el("span","gt");g.textContent=hhmm(m.ts);side.append(g)}
+  else{const av=avatar(m.user);av.style.cursor="pointer";av.onclick=()=>profileModal(m.user);side.append(av)}
   const body=el("div","mb");
   if(m.reply){
     const r=el("div","ref");r.append(ico("reply",14));
@@ -1682,9 +2041,13 @@ function addMsg(m){
     r.append(u,t);r.onclick=()=>jumpTo(m.reply.id);body.append(r);
   }
   if(!grouped){
-    const hd=el("div","mh2"),u=el("b"),t=el("small");u.textContent=m.user;t.textContent=fullTime(m.ts);hd.append(u,t);body.append(hd);
+    const hd=el("div","mh2"),u=el("b"),t=el("small");u.textContent=m.user;u.style.cursor="pointer";u.onclick=()=>profileModal(m.user);t.textContent=fullTime(m.ts);hd.append(u,t);body.append(hd);
   }
-  if(m.text){const p=el("div","mt");renderText(p,m.text);body.append(p)}
+  if(m.text){
+    const p=el("div","mt");renderText(p,m.text);
+    if(m.edited){const e=el("small","edited");e.textContent="編集済み";p.append(e)}
+    body.append(p);
+  }
   if(m.stamp){const i=el("img","stamp");i.alt="スタンプ";i.src=`/api/stamps/${m.stamp}/img?token=${S.token}`;body.append(i)}
   if(m.file_id){
     const url=`/files/${m.file_id}?token=${S.token}`,ty=m.file_type||"";let e;
@@ -1696,9 +2059,15 @@ function addMsg(m){
   body.append(el("div","rx"));
   const act=el("div","act");
   const sm=ibtn("smile","",()=>openPicker(sm,v=>react(m.id,v)),"","リアクション");
-  act.append(sm,ibtn("reply","",()=>setReply(m),"","返信"));
+  act.append(sm);
+  const readOnly=S.chan===S.announce&&!S.owner;
+  if(!readOnly)act.append(ibtn("reply","",()=>setReply(m),"","返信"));
+  const mine=m.user===S.me.name,srv=curServer();
+  if(mine&&m.text)act.append(ibtn("pencil","",()=>editMsg(m),"","編集"));
+  if(mine||(S.chan===S.announce?S.owner:(srv&&srv.admin)))act.append(ibtn("trash","",()=>delMsg(m),"","削除"));
   d.append(side,body,act);
-  $("msgs").append(d);renderReactions(d,m.reactions);
+  renderReactions(d,m.reactions);
+  return d;
 }
 function renderReactions(d,r){
   const rx=d.querySelector(".rx");rx.innerHTML="";
@@ -1972,8 +2341,9 @@ function setSrc(t,src){
 }
 function drawCall(){
   const box=$("call"),tiles=$("tiles");
-  if(!call){box.hidden=true;tiles.innerHTML="";updateCallBtn();return}
-  box.hidden=false;
+  if(!call){box.hidden=true;box.classList.remove("big");tiles.innerHTML="";updateCallBtn();return}
+  box.hidden=false;box.classList.toggle("big",!!S.callBig);
+  const bg=$("bigb");bg.innerHTML=ic(S.callBig?"compress":"expand",22);bg.title=S.callBig?"小さく表示":"大きく表示";
   const ct=$("calltitle");ct.innerHTML="";ct.append(ico("speaker",15),document.createTextNode(chanName(call.channel)));
   const setB=(id,icon,state,title)=>{const b=$(id);b.innerHTML=ic(icon,22);b.classList.toggle("off",state===false);b.classList.toggle("live",state==="live");b.title=title};
   setB("micb",call.mic?"mic":"micoff",call.mic,call.mic?"ミュートする":"ミュートを解除");
@@ -2008,6 +2378,7 @@ function updateCallBtn(){
   b.innerHTML=ic(inHere?"hangup":"phone",18)+`<span class="lbl">${inHere?"退出":"通話"}</span>`;
   b.classList.toggle("live",inHere);b.title=inHere?"通話から退出":"通話に参加";
 }
+function toggleBig(){S.callBig=!S.callBig;drawCall()}
 const callBtn=()=>{if(call&&call.channel===S.chan)leaveCall();else joinCall(S.chan)};
 function drawRing(){
   const r=$("ring");r.innerHTML="";
@@ -2081,6 +2452,7 @@ function serverMenu(){
       const c=el("div","code");c.textContent=s.invite;
       modal("招待コード",[c,ibtn("copy","コピー",()=>copyText(s.invite),"btn")]);
     }),
+    ...(s.admin?[item("gear","サーバー名とアイコンを変更",()=>editServerModal(s))]:[]),
     item("hash","テキストチャンネルを追加",()=>newChannel("text")),
     item("speaker","ボイスチャンネルを追加",()=>newChannel("voice")),
     item("shield","ロールを作成",newRole),
@@ -2123,10 +2495,136 @@ function settingsModal(){
   sc.onchange=()=>{S.sound=sc.checked;localStorage.sound=sc.checked?"1":"0"};sl.append(sc,"通知音を鳴らす");
   const note=el("p","muted");
   note.textContent=S.push?"Push通知が有効なので、アプリを閉じていても通知が届きます (iPhoneはホーム画面に追加してください)。":"サーバー側でPush通知が未設定のため、通知はこのアプリを開いている間だけ届きます。";
+  // テーマ
+  const tl=el("label");tl.textContent="テーマ";
+  const ts=el("select");
+  [["system","システムに合わせる"],["dark","ダーク"],["light","ライト"]].forEach(([v,t])=>{const o=el("option");o.value=v;o.textContent=t;ts.append(o)});
+  ts.value=localStorage.theme||"system";ts.onchange=()=>{localStorage.theme=ts.value;applyTheme()};
+  const cl=el("label");cl.textContent="テーマカラー (好きな色を選べます)";
+  const sw=el("div","swatches");
+  [["標準",""],["スカイ","#38b6ff"],["インディゴ","#6b7cff"],["パープル","#a855f7"],["ピンク","#ec4899"],["レッド","#ef4444"],["オレンジ","#f59e0b"],["グリーン","#22c55e"]].forEach(([n,c])=>{
+    const b=el("button","swt");b.title=n;b.style.background=c||"var(--grad)";
+    b.onclick=()=>{if(c)localStorage.accent=c;else localStorage.removeItem("accent");applyTheme()};sw.append(b);
+  });
+  const ci=el("input");ci.type="color";ci.value=localStorage.accent||"#6b7cff";ci.title="好きな色を選ぶ";
+  ci.oninput=()=>{localStorage.accent=ci.value;applyTheme()};
+  const pl=el("label","chk"),pc=el("input");pc.type="checkbox";pc.checked=localStorage.pop!=="0";
+  pc.onchange=()=>{localStorage.pop=pc.checked?"1":"0";applyTheme()};pl.append(pc,"文字をポップな太字にする");
+  const pr=ibtn("user","プロフィールを編集",()=>{closeModal();editProfileModal()},"ghost");
   const lo=ibtn("logout","ログアウト",()=>{closeModal();logout()},"ghost");
-  modal("設定",[l1,sel,ps,bn,sl,note,lo]);
+  modal("設定",[pr,tl,ts,cl,sw,ci,pl,l1,sel,ps,bn,sl,note,lo]);
+}
+function shiftHue(hex,d){
+  const r=parseInt(hex.slice(1,3),16)/255,g=parseInt(hex.slice(3,5),16)/255,b=parseInt(hex.slice(5,7),16)/255;
+  const mx=Math.max(r,g,b),mn=Math.min(r,g,b),l=(mx+mn)/2;let h=0,s=0;
+  if(mx!==mn){const k=mx-mn;s=l>.5?k/(2-mx-mn):k/(mx+mn);h=(mx===r?(g-b)/k+(g<b?6:0):mx===g?(b-r)/k+2:(r-g)/k+4)*60}
+  h=(h+d)%360;
+  const a=s*Math.min(l,1-l),f=n=>{const k=(n+h/30)%12;return Math.round(255*(l-a*Math.max(-1,Math.min(k-3,9-k,1))))};
+  return "#"+[f(0),f(8),f(4)].map(x=>x.toString(16).padStart(2,"0")).join("");
+}
+function applyTheme(){
+  const t=localStorage.theme||"system",root=document.documentElement;
+  const light=t==="light"||(t==="system"&&matchMedia("(prefers-color-scheme: light)").matches);
+  root.dataset.theme=light?"light":"dark";
+  const a=localStorage.accent;
+  if(a&&/^#[0-9a-f]{6}$/i.test(a)){root.style.setProperty("--acc",a);root.style.setProperty("--acc2",shiftHue(a,50))}
+  else{root.style.removeProperty("--acc");root.style.removeProperty("--acc2")}
+  document.body.classList.toggle("pop",localStorage.pop!=="0");
+  const m=document.querySelector("meta[name=theme-color]");if(m)m.content=light?"#eceef7":"#0e0f14";
+}
+matchMedia("(prefers-color-scheme: light)").addEventListener("change",()=>{if((localStorage.theme||"system")==="system")applyTheme()});
+async function editServerModal(s){
+  let blob=null,remove=false;
+  const prev=el("div","pvc");
+  const draw=url=>{
+    prev.innerHTML="";
+    const a=el("div","av xl");a.style.borderRadius="28px";a.textContent=s.name.slice(0,2);a.style.background=colorOf(s.name);
+    if(url){const i=el("img");i.alt="";i.src=url;a.classList.add("hasimg");a.append(i)}
+    prev.append(a);
+  };
+  draw(s.icon?`/api/servers/${s.id}/icon?v=${s.icon}&token=${S.token}`:null);
+  const fi=el("input");fi.type="file";fi.accept="image/*";fi.hidden=true;
+  fi.onchange=async()=>{
+    const f=fi.files[0];fi.value="";if(!f)return;
+    const b=await squareBlob(f);
+    if(!b){toast("画像を読み込めませんでした");return}
+    blob=b;remove=false;draw(URL.createObjectURL(b));
+  };
+  const row=el("div","row");row.style.justifyContent="center";
+  row.append(ibtn("plus","アイコンを選ぶ",()=>fi.click(),"ghost"),ibtn("trash","アイコンを削除",()=>{blob=null;remove=true;draw(null)},"ghost"),fi);
+  const w1=el("div","fld"),l1=el("label"),ni=el("input");
+  l1.textContent="サーバー名";ni.value=s.name;ni.maxLength=30;w1.append(l1,ni);
+  const go=el("button","btn","保存する");
+  go.onclick=async()=>{
+    try{
+      await api(`/api/servers/${s.id}/edit`,"POST",{name:ni.value.trim()});
+      if(blob)await upload(`/api/servers/${s.id}/icon`,blob);
+      else if(remove)await api(`/api/servers/${s.id}/icon`,"DELETE");
+      closeModal();toast("サーバーを更新しました");await load();
+    }catch(e){toast(e.message)}
+  };
+  modal("サーバー名とアイコン",[prev,row,w1,go]);
 }
 
+/* ---------- プロフィール (アイコン / 名前 / 自己紹介) ---------- */
+async function loadAvatars(){const d=await api("/api/avatars").catch(()=>null);if(d)S.av=d.avatars}
+async function squareBlob(file,size=256){
+  try{
+    const bmp=await createImageBitmap(file),s=Math.min(bmp.width,bmp.height),c=document.createElement("canvas");
+    c.width=c.height=size;
+    c.getContext("2d").drawImage(bmp,(bmp.width-s)/2,(bmp.height-s)/2,s,s,0,0,size,size);
+    return await new Promise(r=>c.toBlob(r,"image/webp",.9));
+  }catch(e){return file.size<=2*1024*1024?file:null}
+}
+async function profileModal(name){
+  const p=await T(()=>api("/api/profile/get","POST",{name}));if(!p)return;
+  const top=el("div","pf");
+  const nm=el("div","pfn");nm.textContent=p.name;
+  const st=el("div","muted");st.textContent=(p.online?"オンライン":"オフライン")+" / 登録日 "+new Date(p.created*1000).toLocaleDateString();
+  const bio=el("div","pfb");bio.textContent=p.bio||"自己紹介はまだありません";if(!p.bio)bio.style.color="var(--tx2)";
+  top.append(el("div","pfbn"),avatar(p.name,"av xl"),nm,st,bio);
+  const act=p.me?ibtn("user","プロフィールを編集",()=>{closeModal();editProfileModal()},"btn")
+                :ibtn("send","メッセージを送る",()=>{closeModal();openDm(p.name)},"btn");
+  modal("プロフィール",[top,act]);
+}
+async function editProfileModal(){
+  const p=await T(()=>api("/api/profile/get","POST",{name:S.me.name}));if(!p)return;
+  let blob=null,remove=false;
+  const prev=el("div","pvc");
+  const draw=url=>{
+    prev.innerHTML="";
+    const a=el("div","av xl");a.textContent=S.me.name.slice(0,1).toUpperCase();a.style.background=colorOf(S.me.name);
+    if(url){const i=el("img");i.alt="";i.src=url;a.classList.add("hasimg");a.append(i)}
+    prev.append(a);
+  };
+  draw(S.av[S.me.name]?`/api/avatar?name=${encodeURIComponent(S.me.name)}&v=${S.av[S.me.name]}&token=${S.token}`:null);
+  const fi=el("input");fi.type="file";fi.accept="image/*";fi.hidden=true;
+  fi.onchange=async()=>{
+    const f=fi.files[0];fi.value="";if(!f)return;
+    const b=await squareBlob(f);
+    if(!b){toast("画像を読み込めませんでした");return}
+    blob=b;remove=false;draw(URL.createObjectURL(b));
+  };
+  const row=el("div","row");row.style.justifyContent="center";
+  row.append(ibtn("plus","アイコンを選ぶ",()=>fi.click(),"ghost"),ibtn("trash","アイコンを削除",()=>{blob=null;remove=true;draw(null)},"ghost"),fi);
+  const w1=el("div","fld"),l1=el("label"),ni=el("input");
+  l1.textContent="名前 (ログインにも使います / 2〜20文字)";ni.value=S.me.name;ni.maxLength=20;w1.append(l1,ni);
+  const w2=el("div","fld"),l2=el("label"),ta=el("textarea");
+  l2.textContent="自己紹介 (200文字まで)";ta.value=p.bio;ta.maxLength=200;ta.placeholder="好きなことや、ひとことをどうぞ";w2.append(l2,ta);
+  const go=el("button","btn","保存する");
+  go.onclick=async()=>{
+    try{
+      await api("/api/profile","POST",{name:ni.value.trim(),bio:ta.value.trim()});
+      if(blob)await upload("/api/profile/avatar",blob);
+      else if(remove)await api("/api/profile/avatar","DELETE");
+      closeModal();toast("プロフィールを保存しました");
+      await loadAvatars();await load();if(S.chan)openChan(S.chan,true);
+    }catch(e){toast(e.message)}
+  };
+  modal("プロフィールを編集",[prev,row,w1,w2,go]);
+}
+
+applyTheme();
 initIcons();
 if(S.token)boot();
 </script>"""
