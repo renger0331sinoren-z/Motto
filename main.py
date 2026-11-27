@@ -1797,6 +1797,53 @@ body.pop .annt{color:#ff9500}
 #srch input{width:210px;padding:8px 38px 8px 12px;border-radius:10px;background:var(--bg3);font-size:14px}
 #srch #sqb{position:absolute;right:2px;padding:6px}
 @media(max-width:820px){#srch input{display:none}#srch #sqb{position:static}}
+
+/* ======== v5: 上部ヨコバー + かっこいいUI ======== */
+:root{--glow:color-mix(in srgb,var(--acc) 45%,transparent);--glass:color-mix(in srgb,var(--bg) 78%,transparent)}
+#rail{position:relative;flex-direction:row;width:auto;height:68px;padding:0 16px;gap:12px;align-items:center;justify-content:flex-start;
+ overflow-x:auto;overflow-y:hidden;border-right:0;border-bottom:1px solid var(--line);
+ background:linear-gradient(180deg,color-mix(in srgb,var(--acc) 9%,var(--bg)),var(--bg));backdrop-filter:blur(16px);scrollbar-width:none}
+#rail::-webkit-scrollbar{display:none}
+#rail::after{content:"";position:absolute;left:0;right:0;bottom:-1px;height:1px;background:var(--grad);opacity:.55;pointer-events:none}
+.rb{flex:none;width:46px;height:46px;border-radius:15px;background:var(--bg3);border:1px solid var(--line);
+ box-shadow:0 2px 10px #0004;transition:transform .18s cubic-bezier(.3,1.5,.5,1),border-radius .18s,box-shadow .18s,background .18s}
+.rb:hover{transform:translateY(-3px) scale(1.06);border-radius:13px;background:var(--bg4);box-shadow:0 8px 20px var(--glow)}
+.rb.active{border-radius:13px;background:var(--grad);border-color:transparent;box-shadow:0 6px 22px var(--glow)}
+.rb.active::before{left:50%;top:auto;bottom:-11px;width:22px;height:4px;transform:translateX(-50%);border-radius:4px 4px 0 0;background:var(--acc);box-shadow:0 -2px 10px var(--glow)}
+.rb.home{border-radius:15px}
+.rb.green{border-style:dashed;border-color:color-mix(in srgb,var(--ok) 55%,transparent);background:transparent}
+.rb.green:hover{background:var(--ok);border-style:solid;box-shadow:0 8px 20px color-mix(in srgb,var(--ok) 50%,transparent)}
+.sep{width:2px;height:28px;border-radius:2px;background:linear-gradient(180deg,transparent,var(--line),transparent)}
+
+/* 左のリスト・ヘッダー・メッセージ欄を少しリッチに */
+#side{background:linear-gradient(180deg,var(--bg2),color-mix(in srgb,var(--bg2) 92%,var(--acc)))}
+#sidehead{font-size:15px;letter-spacing:.03em;min-height:52px}
+.ch{border-radius:12px;transition:background .15s,color .15s,transform .12s}
+.ch:hover{transform:translateX(2px)}
+.ch.active{background:linear-gradient(90deg,color-mix(in srgb,var(--acc) 26%,transparent),transparent);box-shadow:inset 3px 0 0 var(--acc)}
+#head{backdrop-filter:blur(14px);background:var(--glass);min-height:52px}
+#meb{background:color-mix(in srgb,var(--bg) 85%,var(--acc))}
+.av{box-shadow:0 2px 8px #0005}
+button.btn,.btn{box-shadow:0 4px 16px var(--glow)}
+input:focus,select:focus,textarea:focus{box-shadow:0 0 0 3px color-mix(in srgb,var(--acc) 28%,transparent)}
+.addbar{border-radius:14px}
+
+/* PC: 横バーを最上段に、その下に サイド | メイン | メンバー */
+@media(min-width:821px){
+ #app{display:grid;grid-template-columns:256px minmax(0,1fr) auto;grid-template-rows:68px minmax(0,1fr)}
+ #nav{display:contents}
+ #rail{grid-column:1/-1;grid-row:1}
+ #side{grid-column:1;grid-row:2;min-height:0;width:auto}
+ #main{grid-column:2;grid-row:2;min-height:0}
+ #members{grid-column:3;grid-row:2;min-height:0}
+}
+
+/* スマホ: ドロワーの一番上に横スクロールのバー */
+@media(max-width:820px){
+ #nav{flex-direction:column;width:min(84vw,320px)}
+ #rail{width:100%;height:calc(68px + var(--sat));padding:var(--sat) 12px 0;flex:none}
+ #side{width:100%;flex:1;min-height:0}
+}
 </style>
 
 <div id=auth>
