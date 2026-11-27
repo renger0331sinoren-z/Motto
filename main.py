@@ -1750,6 +1750,33 @@ body.pop .annt{color:#ff9500}
 #call.big .tile.screen{max-height:none;grid-column:1/-1;aspect-ratio:auto}
 #call.big #ctl{padding-top:12px}
 @media(max-width:820px){#call.big #tiles{grid-template-columns:repeat(auto-fit,minmax(min(100%,150px),1fr))}}
+
+/* ---- 通話画面 (黒背景・丸いアイコン・ピル型のコントロール) ---- */
+#call{background:#000;border-bottom:1px solid #ffffff14;padding:12px 14px 14px;max-height:56vh}
+#calltitle{color:#8b8fa6}
+#tiles{display:flex;flex-wrap:wrap;justify-content:center;align-items:center;gap:14px;min-height:130px;padding:6px 0}
+.tile{width:150px;height:130px;aspect-ratio:auto;background:transparent;border:0;border-radius:16px}
+.tile.cam{width:240px;height:150px;background:#101116}
+.tile.screen{width:min(100%,680px);height:auto;aspect-ratio:16/9;max-height:42vh;background:#101116}
+.tile:not(.cam):not(.screen) .nm{left:50%;transform:translateX(-50%);bottom:2px;background:transparent;font-size:13px;white-space:nowrap}
+.av.cav{width:84px;height:84px;font-size:34px;margin-bottom:16px}
+#ctl{gap:12px;margin-top:10px;align-items:center}
+.cg{display:flex;align-items:center;background:#16171c;border:1px solid #ffffff14;border-radius:14px;padding:4px;gap:2px}
+.cg:not(:has(button:not([hidden]))){display:none}
+#ctl .cg button{width:44px;height:40px;border-radius:10px;padding:0;background:transparent;color:#fff}
+#ctl .cg button:hover{background:#ffffff18;filter:none}
+#ctl .cg button.caret{width:24px;color:#9a9eb6}
+#ctl .cg button.off{color:#ff7683;background:#ff5a6a24}
+#ctl .cg button.live{color:#2fd27a;background:#2fd27a22}
+#ctl #hangb{width:64px;height:48px;border-radius:12px;background:#d63040;color:#fff}
+#call.big{background:#000}
+#call.big #tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr));grid-auto-rows:minmax(0,1fr);flex:1;min-height:0;gap:12px}
+#call.big .tile,#call.big .tile.cam{width:auto;height:auto;min-height:0}
+#call.big .tile.cam,#call.big .tile.screen{background:#101116}
+#call.big .tile.screen{grid-column:1/-1;max-height:none;aspect-ratio:auto}
+#call.big .av.cav{width:128px;height:128px;font-size:52px;margin-bottom:22px}
+#call.big .tile:not(.cam):not(.screen) .nm{font-size:15px;bottom:14px}
+@media(max-width:820px){.tile{width:120px;height:116px}.tile.cam{width:46vw;height:130px}.av.cav{width:68px;height:68px;font-size:28px}#call.big .av.cav{width:96px;height:96px;font-size:40px}}
 </style>
 
 <div id=auth>
@@ -1786,11 +1813,15 @@ body.pop .annt{color:#ff9500}
   <div id=call hidden>
    <div id=calltitle></div><div id=tiles></div>
    <div id=ctl>
-    <button id=micb onclick="toggleMic()"></button>
-    <button id=camb onclick="toggleCam()"></button>
-    <button id=flipb class=wide onclick="switchCam()" hidden></button>
-    <button id=scrb onclick="toggleScreen()" hidden></button>
-    <button id=bigb onclick="toggleBig()"></button>
+    <div class=cg>
+     <button id=micb onclick="toggleMic()"></button><button id=micc class=caret onclick="deviceMenu('audioinput')"></button>
+     <button id=camb onclick="toggleCam()"></button><button id=camc class=caret onclick="deviceMenu('videoinput')"></button>
+    </div>
+    <div class=cg>
+     <button id=scrb onclick="toggleScreen()" hidden></button>
+     <button id=flipb onclick="switchCam()" hidden></button>
+     <button id=bigb onclick="toggleBig()"></button>
+    </div>
     <button id=hangb class=hang onclick="leaveCall()"></button>
    </div>
   </div>
@@ -1858,6 +1889,7 @@ const IC={
  download:'<path d="M12 4v11M7 11l5 5 5-5M5 20h14"/>',
  zoomin:'<circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4M11 8v6M8 11h6"/>',
  zoomout:'<circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4M8 11h6"/>',
+ chev:'<path d="M6 9l6 6 6-6"/>',
  logout:'<path d="M9 4H5a1 1 0 0 0-1 1v14a1 1 0 0 0 1 1h4M16 8l4 4-4 4M20 12H9"/>'
 };
 const ic=(n,s=18)=>`<svg class="svg" width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${IC[n]}</svg>`;
@@ -1966,7 +1998,7 @@ function initIcons(){
   $("bclip").innerHTML=ic("clip",21);$("bclip").title="ファイルを送信";$("bstamp").innerHTML=ic("sticker",21);$("bstamp").title="スタンプ";
   $("bemoji").innerHTML=ic("smile",21);$("bemoji").title="絵文字";
   $("bsend").innerHTML=ic("send",18)+'<span class="lbl">送信</span>';$("bsend").title="送信";
-  $("hangb").innerHTML=ic("hangup",22);$("hangb").title="通話を終了";
+  $("hangb").innerHTML=ic("hangup",22);$("hangb").title="通話を終了";$("micc").innerHTML=ic("chev",14);$("micc").title="マイクを選ぶ";$("camc").innerHTML=ic("chev",14);$("camc").title="カメラを選ぶ";
   $("navbtn").title="メニュー";$("membtn").title="メンバー";
 }
 async function doAuth(kind){
@@ -2524,7 +2556,9 @@ async function leaveCall(local){
   call.stream.getTracks().forEach(t=>t.stop());
   if(call.vtrack)call.vtrack.stop();
   if(call.strack){call.strack.onended=null;call.strack.stop()}
-  call=null;drawCall();drawList();drawRing();
+  call=null;S.callBig=false;
+  try{if(document.fullscreenElement)document.exitFullscreen().catch(()=>{})}catch(e){}
+  drawCall();drawList();drawRing();
 }
 function newPeer(id,name){
   const pc=new RTCPeerConnection(ICE);
@@ -2604,7 +2638,7 @@ async function toggleMic(){
 }
 async function camStream(){
   const c={width:{ideal:1280},height:{ideal:720}};
-  if(coarse)c.facingMode=call.facing;else if(call.devId)c.deviceId={exact:call.devId};
+  if(call.devId)c.deviceId={exact:call.devId};else if(coarse)c.facingMode=call.facing;
   return navigator.mediaDevices.getUserMedia({video:c});
 }
 async function applyVideo(t){
@@ -2624,7 +2658,7 @@ async function toggleCam(){
 async function switchCam(){
   if(!call||!call.cam)return;
   const old=call.vtrack;
-  if(coarse)call.facing=call.facing==="user"?"environment":"user";
+  if(coarse){call.facing=call.facing==="user"?"environment":"user";call.devId=null}
   else{
     const ds=(await navigator.mediaDevices.enumerateDevices()).filter(d=>d.kind==="videoinput");
     if(ds.length<2)return;
@@ -2676,14 +2710,14 @@ function drawCall(){
   setB("micb",call.mic?"mic":"micoff",call.mic,!call.atrack?"マイクをオンにする":call.mic?"ミュートする":"ミュートを解除");
   setB("camb",call.cam?"video":"videooff",call.cam,call.cam?"カメラをオフ":"カメラをオン");
   const fb=$("flipb");fb.hidden=!(call.cam&&call.multi);
-  if(!fb.hidden){fb.innerHTML=ic("flip",20)+`<span>${coarse?(call.facing==="user"?"インカメラ":"アウトカメラ"):"カメラ切替"}</span>`;fb.title="タップでカメラを切り替え"}
+  if(!fb.hidden){fb.innerHTML=ic("flip",20);fb.title=coarse?(call.facing==="user"?"アウトカメラに切り替え":"インカメラに切り替え"):"カメラを切り替え"}
   const sb=$("scrb");sb.hidden=!canScreen;
   if(canScreen)setB("scrb","screen",call.screen?"live":true,call.screen?"画面共有を停止":"画面を共有");
   const users=S.calls[call.channel]||[],keep=new Set();
   users.forEach(u=>{
     const me=u.id===S.me.id,id="t"+u.id;keep.add(id);
     const t=getTile(tiles,id,"",me);
-    if(!t.querySelector(".av"))t.insertBefore(avatar(u.name,"av lg"),t.querySelector(".nm"));
+    if(!t.querySelector(".av"))t.insertBefore(avatar(u.name,"av cav"),t.querySelector(".nm"));
     t.classList.toggle("cam",!!u.cam);t.classList.toggle("off",!u.mic);
     t.classList.toggle("mirror",me&&(!coarse||call.facing==="user"));
     const nm=t.querySelector(".nm");nm.innerHTML="";if(!u.mic)nm.append(ico("micoff",13));nm.append(document.createTextNode(me?u.name+" (あなた)":u.name));
@@ -2705,7 +2739,46 @@ function updateCallBtn(){
   b.innerHTML=ic(inHere?"hangup":"phone",18)+`<span class="lbl">${inHere?"退出":"通話"}</span>`;
   b.classList.toggle("live",inHere);b.title=inHere?"通話から退出":"通話に参加";
 }
-function toggleBig(){S.callBig=!S.callBig;drawCall()}
+function toggleBig(){
+  S.callBig=!S.callBig;
+  try{
+    if(S.callBig&&document.documentElement.requestFullscreen)document.documentElement.requestFullscreen().catch(()=>{});
+    else if(!S.callBig&&document.fullscreenElement)document.exitFullscreen().catch(()=>{});
+  }catch(e){}
+  drawCall();
+}
+document.addEventListener("fullscreenchange",()=>{if(!document.fullscreenElement&&S.callBig){S.callBig=false;if(call)drawCall()}});
+async function deviceMenu(kind){
+  if(!call)return;
+  const isA=kind==="audioinput";
+  let ds=[];
+  try{ds=(await navigator.mediaDevices.enumerateDevices()).filter(d=>d.kind===kind)}catch(e){}
+  if(!ds.length){toast(isA?"マイクが見つかりません":"カメラが見つかりません");return}
+  const t=isA?call.atrack:call.vtrack,cur=t&&t.getSettings().deviceId;
+  modal(isA?"マイクを選ぶ":"カメラを選ぶ",ds.map((d,i)=>{
+    const b=el("button","mi ghost");b.textContent=(d.label||(isA?"マイク ":"カメラ ")+(i+1))+(d.deviceId===cur?"  ✓":"");
+    b.onclick=()=>{closeModal();isA?pickMic(d.deviceId):pickCam(d.deviceId)};return b;
+  }));
+}
+async function pickMic(id){
+  if(!call)return;
+  let st;
+  try{st=await navigator.mediaDevices.getUserMedia({audio:{...AUDIO,deviceId:{exact:id}}})}
+  catch(e){toast("このマイクに切り替えられませんでした");return}
+  const t=st.getAudioTracks()[0],on=call.atrack?call.mic:true,old=call.stream;
+  t.enabled=on;call.mic=on;call.stream=st;call.atrack=t;
+  for(const p of Object.values(call.peers))if(p.as)await p.as.replaceTrack(t);
+  old.getTracks().forEach(x=>x.stop());
+  sendMedia();drawCall();
+}
+async function pickCam(id){
+  if(!call)return;
+  call.devId=id;
+  if(!call.cam){toggleCam();return}
+  call.vtrack.stop();
+  try{await applyVideo((await camStream()).getVideoTracks()[0])}
+  catch(e){toast("このカメラに切り替えられませんでした");await applyVideo(null)}
+}
 const callBtn=()=>{if(call&&call.channel===S.chan)leaveCall();else joinCall(S.chan)};
 function drawRing(){
   const r=$("ring");r.innerHTML="";
