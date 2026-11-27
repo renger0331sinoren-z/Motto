@@ -1554,6 +1554,10 @@ async def ws_endpoint(ws: WebSocket, token: str = ""):
                         raise HTTPException(404, "スタンプが見つかりません")
                     rp = d.get("reply_to")
                     await post_message(uid, cid, "", None, sid, int(rp) if rp else None)
+                elif t == "typing":
+                    cid = int(d["channel"])
+                    require(uid, cid, P_SEND)
+                    await push([x for x in channel_users(cid) if x != uid], {"type": "typing", "channel": cid, "name": u["name"]})
                 elif t == "react":
                     await toggle_reaction(uid, int(d["message_id"]), str(d["emoji"])[:16])
                 elif t == "call_join":
@@ -2049,6 +2053,13 @@ body.big button{min-height:44px}
  .setnav{position:relative}
 }
 @media(min-width:821px){.setback,.setx{display:none!important}}
+
+/* 入力中 / ボイスメッセージ */
+#typing{padding:2px 18px 4px;min-height:22px;font-size:13px;color:var(--tx2);display:flex;align-items:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#typing b{font-weight:800;color:var(--tx2)}#typing .tyt{color:var(--acc);font-weight:700}
+#bvoice.rec{background:var(--bad)!important;color:#fff!important;animation:recpulse 1.2s infinite}
+@keyframes recpulse{50%{box-shadow:0 0 0 6px color-mix(in srgb,var(--bad) 30%,transparent)}}
+.vmsg audio{width:min(320px,100%);height:40px;display:block;margin-top:6px}
 </style>
 
 <div id=auth>
@@ -2099,7 +2110,7 @@ body.big button{min-height:44px}
     <button id=hangb class=hang onclick="leaveCall()"></button>
    </div>
   </div>
-  <div id=msgs></div><div id=prog></div>
+  <div id=msgs></div><div id=prog></div><div id=typing></div>
   <div id=replybar hidden></div>
   <div id=stampbox hidden></div>
   <div id=ronote class=muted hidden style="text-align:center;padding:14px">公式アナウンスはオーナーだけが投稿できます</div>
@@ -2309,8 +2320,9 @@ function connect(){
 }
 function onEvent(e){
   const d=JSON.parse(e.data);
-  if(d.type==="message"){
-    const m=d.message;
+  if(d.type==="typing"){tyAdd(d.channel,d.name)}
+  else if(d.type==="message"){
+    const m=d.message;if(TY[m.channel]){delete TY[m.channel][m.user];tyDraw()}
     if(m.channel===S.chan){
       addMsg(m);$("msgs").scrollTop=1e9;
       if(document.hidden||!document.hasFocus()){S.unread[m.channel]=1;updateTitle()}
@@ -2570,6 +2582,7 @@ function buildMsg(m,grouped){
     const url=`/files/${m.file_id}?token=${S.token}`,ty=m.file_type||"";let e;
     if(ty.startsWith("video/")){e=el("video");e.controls=true;e.preload="metadata";e.playsInline=true;e.src=url}
     else if(ty.startsWith("image/")){e=el("img","pic");e.src=url;e.title="クリックで拡大";e.onclick=()=>openLightbox(m,url)}
+    else if(ty.startsWith("audio/")){e=el("div","vmsg");const au=el("audio");au.controls=true;au.preload="metadata";au.src=url;e.append(au)}
     else{e=el("a","fileln");e.href=dlUrl(m);e.download=m.file_name||"file";e.append(ico("download",18));const s=el("span");s.textContent=m.file_name;e.append(s)}
     body.append(e);
     if(ty.startsWith("video/")||ty.startsWith("image/")){
@@ -3666,6 +3679,65 @@ function settingsModal(page){
   if(!MOB()||page)show(page||"acct");
 }
 document.addEventListener("keydown",e=>{if(e.key==="Escape"&&$("settings")&&$("modal").hidden&&!$("lb"))closeSettings()});
+
+/* ---------- 入力中の表示 ---------- */
+const TY={};let tyLast=0;
+function tyAdd(cid,name){(TY[cid]=TY[cid]||{})[name]=Date.now()+4500;tyDraw()}
+function tyDraw(){
+  const box=$("typing");if(!box)return;
+  const now=Date.now(),o=TY[S.chan]||{},names=Object.keys(o).filter(n=>o[n]>now&&n!==(S.me&&S.me.name));
+  box.innerHTML="";
+  if(!names.length)return;
+  const b=el("b"),t=el("span","tyt");
+  b.textContent=names.length>2?"数人":names.join("、");t.textContent=" が入力中";
+  box.append(b,t);
+}
+setInterval(tyDraw,500);
+$("txt").addEventListener("input",()=>{
+  if(!S.chan||!$("txt").value.trim())return;
+  const now=Date.now();if(now-tyLast<2500)return;
+  tyLast=now;wsend({type:"typing",channel:S.chan});
+});
+
+/* ---------- ボイスメッセージ (録音して送る) ---------- */
+let rec=null;
+const bvoice=ibtn("mic","",()=>toggleVoiceRec(),"ghost","ボイスメッセージを録音");bvoice.id="bvoice";
+const bvc=ibtn("x","",()=>stopRec(false),"ghost","録音をやめる");bvc.id="bvc";bvc.hidden=true;
+$("bclip").after(bvoice,bvc);
+const mmss=ms=>{const s=Math.floor(ms/1000);return Math.floor(s/60)+":"+String(s%60).padStart(2,"0")};
+function recUI(on){
+  bvoice.classList.toggle("rec",on);bvoice.innerHTML=ic(on?"send":"mic",21);
+  bvoice.title=on?"録音を送信":"ボイスメッセージを録音";bvc.hidden=!on;
+  $("prog").textContent=on&&rec?`● 録音中 ${mmss(Date.now()-rec.t0)}  (マイクボタンで送信 / ✕で破棄)`:"";
+}
+async function toggleVoiceRec(){
+  if(rec){stopRec(true);return}
+  if(!S.chan||S.chan===S.announce)return;
+  if(!window.MediaRecorder){toast("このブラウザは録音に対応していません");return}
+  let st;
+  try{st=await navigator.mediaDevices.getUserMedia({audio:AUDIO})}catch(e){toast("マイクを使えません。ブラウザで許可してください");return}
+  const chunks=[],mr=new MediaRecorder(st);
+  rec={mr,st,chunks,cid:S.chan,t0:Date.now(),cancel:false,tm:0};
+  mr.ondataavailable=e=>{if(e.data&&e.data.size)chunks.push(e.data)};
+  mr.onstop=async()=>{
+    const r=rec;if(!r)return;
+    clearInterval(r.tm);st.getTracks().forEach(t=>t.stop());
+    const dur=Date.now()-r.t0;rec=null;recUI(false);
+    if(r.cancel||!chunks.length)return;
+    if(dur<600){toast("短すぎます。もう少し長く録音してください");return}
+    const type=(mr.mimeType||"audio/webm").split(";")[0];
+    const ext=type.includes("mp4")?"m4a":type.includes("ogg")?"ogg":"webm";
+    try{
+      await upload(`/api/channels/${r.cid}/upload?name=${encodeURIComponent("ボイスメッセージ."+ext)}&type=${encodeURIComponent(type)}`,new Blob(chunks,{type}),
+        e=>{$("prog").textContent=`送信中 ${(e.loaded/e.total*100).toFixed(0)}%`});
+    }catch(e){toast(e.message)}
+    $("prog").textContent="";
+  };
+  mr.start();
+  rec.tm=setInterval(()=>{if(!rec)return;recUI(true);if(Date.now()-rec.t0>10*60*1000)stopRec(true)},250);
+  recUI(true);
+}
+function stopRec(send){if(!rec)return;rec.cancel=!send;try{rec.mr.stop()}catch(e){rec.st.getTracks().forEach(t=>t.stop());rec=null;recUI(false)}}
 
 applyPrefs();
 applyTheme();
