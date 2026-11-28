@@ -14,15 +14,21 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import http.client
+import ipaddress
 import json
 import os
 import re
 import secrets
+import socket
 import sqlite3
+import ssl as _ssl
 import time
 import traceback
 import uuid
+from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import urljoin, urlparse
 
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
@@ -1771,6 +1777,209 @@ async def sw():
     return Response(SW_JS, media_type="application/javascript", headers={"Cache-Control": "no-cache", "Service-Worker-Allowed": "/"})
 
 
+# ------------------------------------------------------------------ リンクのプレビュー (OGP)
+# 他人のURLをサーバーが取りに行くので、内部ネットワークへの接続 (SSRF) は厳しく防ぐ:
+#  - http/https の 80/443/8080/8443 だけ
+#  - 名前解決した全アドレスが「公開アドレス」でなければ拒否 (localhost・プライベート・リンクローカル等)
+#  - 検証したIPへそのまま接続 (DNSの引き直しで差し替えられない)、リダイレクトも毎回検証
+#  - 本文は最大 512KB / 全体 10秒 まで
+class _PinHTTP(http.client.HTTPConnection):
+    def __init__(self, host, ip, port, timeout):
+        super().__init__(host, port, timeout=timeout)
+        self._ip = ip
+
+    def connect(self):
+        self.sock = socket.create_connection((self._ip, self.port), self.timeout)
+
+
+class _PinHTTPS(http.client.HTTPSConnection):
+    def __init__(self, host, ip, port, timeout):
+        super().__init__(host, port, timeout=timeout, context=_ssl.create_default_context())
+        self._ip = ip
+
+    def connect(self):
+        sock = socket.create_connection((self._ip, self.port), self.timeout)
+        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+
+
+def _resolve_public(host, port):
+    try:
+        infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    except (OSError, UnicodeError):
+        raise ValueError("名前解決できません")
+    first = None
+    for info in infos:
+        addr = info[4][0].split("%")[0]
+        ip = ipaddress.ip_address(addr)
+        if getattr(ip, "ipv4_mapped", None):
+            ip = ip.ipv4_mapped
+        if not ip.is_global:
+            raise ValueError("このアドレスには接続できません")
+        first = first or info[4][0]
+    if not first:
+        raise ValueError("名前解決できません")
+    return first
+
+
+def _safe_fetch(url, accept, read_types, max_bytes, timeout=6, total=10):
+    """(最終URL, content-type, charset, 本文 or None) を返す。本文は read_types に当てはまるときだけ読む"""
+    deadline = time.monotonic() + total
+    for _ in range(5):
+        p = urlparse(url)
+        if p.scheme not in ("http", "https") or not p.hostname:
+            raise ValueError("http / https のURLだけ使えます")
+        port = p.port or (443 if p.scheme == "https" else 80)
+        if port not in (80, 443, 8080, 8443):
+            raise ValueError("このポートには接続できません")
+        ip = _resolve_public(p.hostname, port)
+        conn = (_PinHTTPS if p.scheme == "https" else _PinHTTP)(p.hostname, ip, port, timeout)
+        try:
+            path = (p.path or "/") + (("?" + p.query) if p.query else "")
+            conn.request("GET", path, headers={
+                "User-Agent": "Mozilla/5.0 (compatible; MottoLinkPreview/1.0)",
+                "Accept": "text/html,application/xhtml+xml,image/*;q=0.8",
+                "Accept-Language": "ja,en;q=0.8",
+                "Accept-Encoding": "identity",
+            })
+            r = conn.getresponse()
+            if r.status in (301, 302, 303, 307, 308):
+                loc = r.getheader("Location")
+                if not loc:
+                    raise ValueError("リダイレクト先がありません")
+                url = urljoin(url, loc)
+                continue
+            if r.status != 200:
+                raise ValueError("取得できません")
+            head = r.getheader("Content-Type") or ""
+            ctype = head.split(";")[0].strip().lower()
+            if not any(ctype.startswith(a) for a in accept):
+                raise ValueError("対応していない形式です")
+            m = re.search(r"charset=([\w\-]+)", head, re.I)
+            body = None
+            if any(ctype.startswith(t) for t in read_types):
+                buf = bytearray()
+                while len(buf) < max_bytes and time.monotonic() < deadline:
+                    chunk = r.read(min(16384, max_bytes - len(buf)))
+                    if not chunk:
+                        break
+                    buf += chunk
+                body = bytes(buf)
+            return url, ctype, (m.group(1) if m else ""), body
+        finally:
+            conn.close()
+    raise ValueError("リダイレクトが多すぎます")
+
+
+class _OG(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.meta = {}
+        self.title = ""
+        self._in_title = False
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == "meta":
+            k = (a.get("property") or a.get("name") or "").lower()
+            if k and a.get("content") and k not in self.meta:
+                self.meta[k] = a["content"]
+        elif tag == "title":
+            self._in_title = True
+
+    def handle_endtag(self, tag):
+        if tag == "title":
+            self._in_title = False
+
+    def handle_data(self, data):
+        if self._in_title and len(self.title) < 300:
+            self.title += data
+
+
+def _decode_html(body, charset):
+    if not charset:
+        m = re.search(rb"<meta[^>]+charset=[\"']?([\w\-]+)", body[:4096], re.I)
+        charset = m.group(1).decode("ascii", "ignore") if m else "utf-8"
+    try:
+        return body.decode(charset, "replace")
+    except LookupError:
+        return body.decode("utf-8", "replace")
+
+
+def _clip(s, n):
+    return " ".join((s or "").split())[:n]
+
+
+_IMG_OK = ("image/png", "image/jpeg", "image/gif", "image/webp", "image/avif")
+_LP_CACHE = {}
+
+
+def _link_preview(url):
+    now = time.time()
+    hit = _LP_CACHE.get(url)
+    if hit and hit[0] > now:
+        return hit[1]
+    try:
+        final, ctype, cs, body = _safe_fetch(
+            url, ("text/html", "application/xhtml", "image/"), ("text/html", "application/xhtml"), 512 * 1024
+        )
+        if ctype.startswith("image/"):
+            res = {"ok": ctype in _IMG_OK, "kind": "image", "url": final, "image": final}
+        else:
+            og = _OG()
+            try:
+                og.feed(_decode_html(body or b"", cs))
+            except Exception:
+                pass
+            mt = og.meta
+            title = _clip(mt.get("og:title") or mt.get("twitter:title") or og.title, 120)
+            desc = _clip(mt.get("og:description") or mt.get("twitter:description") or mt.get("description"), 200)
+            img = mt.get("og:image") or mt.get("og:image:url") or mt.get("twitter:image") or ""
+            img = urljoin(final, img.strip()) if img else ""
+            if not img.startswith(("http://", "https://")):
+                img = ""
+            res = {
+                "ok": bool(title or desc or img),
+                "url": final,
+                "site": _clip(mt.get("og:site_name") or (urlparse(final).hostname or ""), 60),
+                "title": title,
+                "desc": desc,
+                "image": img,
+            }
+    except Exception:
+        res = {"ok": False}
+    if len(_LP_CACHE) > 300:
+        _LP_CACHE.pop(next(iter(_LP_CACHE)))
+    _LP_CACHE[url] = (now + (3600 if res.get("ok") else 300), res)
+    return res
+
+
+@app.get("/api/linkpreview")
+async def link_preview(url: str, u=Depends(current_user)):
+    if len(url) > 2000:
+        return {"ok": False}
+    return await asyncio.to_thread(_link_preview, url)
+
+
+@app.get("/api/linkimg")
+async def link_img(url: str, u=Depends(current_user)):
+    """プレビュー画像はサーバー経由で配る (相手サイトにIPが渡らない / http画像のmixed contentも避けられる)"""
+    if len(url) > 2000:
+        raise HTTPException(404, "画像を取得できません")
+    try:
+        _final, ctype, _cs, body = await asyncio.to_thread(_safe_fetch, url, _IMG_OK, _IMG_OK, 3 * 1024 * 1024)
+    except Exception:
+        raise HTTPException(404, "画像を取得できません")
+    return Response(
+        body,
+        media_type=ctype,
+        headers={
+            "Cache-Control": "private, max-age=86400",
+            "X-Content-Type-Options": "nosniff",
+            "Content-Security-Policy": "default-src 'none'; sandbox",
+        },
+    )
+
+
 # ------------------------------------------------------------------ 画面
 PAGE = r"""<!doctype html><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover">
@@ -2186,6 +2395,41 @@ body.big button{min-height:44px}
  .srow .rm{width:100%;min-height:46px;justify-content:center}
 }
 @keyframes sheetUp{from{transform:translateY(40px);opacity:0}to{transform:none;opacity:1}}
+
+/* ---- 一番下へボタン / リンク / 埋め込み / ボイスメッセージ / 更新通知 ---- */
+#bar{position:relative}
+.bdown{position:absolute;right:14px;bottom:calc(100% + 10px);width:42px;height:42px;padding:0;border-radius:50%;border:1px solid var(--line);background:var(--bg4);color:var(--tx);display:grid;place-items:center;cursor:pointer;box-shadow:0 6px 18px #0006;z-index:5}
+.bdown:hover{background:var(--hov2)}
+.bdown.new{border-color:var(--acc);color:var(--acc)}
+.bdown .bdn{position:absolute;top:-7px;right:-4px;min-width:20px;height:20px;padding:0 5px;border-radius:10px;background:var(--bad);color:#fff;font-size:11px;font-weight:800;display:grid;place-items:center}
+.mt a.lnk{color:var(--acc);text-decoration:underline;text-underline-offset:2px;word-break:break-all}
+.mt a.lnk:hover{filter:brightness(1.2)}
+.lpc{display:block;max-width:min(420px,100%);margin-top:8px;padding:10px 12px;background:var(--bg4);border:1px solid var(--line);border-left:4px solid var(--acc);border-radius:12px;color:var(--tx);text-decoration:none;overflow:hidden}
+.lpc:hover{background:var(--hov2)}
+.lps{font-size:12px;color:var(--tx2);margin-bottom:2px}
+.lph{font-weight:800;color:var(--acc);line-height:1.35;word-break:break-word;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.lpd{font-size:13px;color:var(--tx2);margin-top:4px;line-height:1.45;word-break:break-word;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.lpc img.lpi{display:block;width:100%;max-height:220px;object-fit:cover;border-radius:8px;margin-top:8px;background:var(--bg3)}
+.lpc.lpimg{padding:0;border:0;background:none}
+.lpc.lpimg img{display:block;max-width:100%;max-height:320px;border-radius:12px}
+.vp{display:flex;align-items:center;gap:12px;margin-top:6px;padding:10px 14px 10px 10px;width:min(340px,100%);background:var(--bg4);border:1px solid var(--line);border-radius:18px;transition:border-color .15s}
+.vp.play{border-color:var(--acc)}
+.vpb{flex:none;width:44px;height:44px;padding:0;border:0;border-radius:50%;display:grid;place-items:center;background:var(--grad);color:#fff;cursor:pointer;box-shadow:0 4px 14px #0004}
+.vpb .svg{fill:currentColor;stroke-width:3}
+.vcol{flex:1;min-width:0;display:flex;flex-direction:column;gap:5px}
+.vwave{display:flex;align-items:center;gap:2px;height:30px;cursor:pointer;touch-action:none}
+.vwave i{flex:1;min-width:2px;max-width:6px;border-radius:3px;background:var(--tx2);opacity:.38;transition:opacity .12s,background .12s}
+.vwave i.on{background:var(--acc);opacity:1}
+.vmeta{display:flex;align-items:center;gap:8px}
+.vt{flex:1;font-size:12px;font-variant-numeric:tabular-nums;color:var(--tx2)}
+.vsp{flex:none;border:0;border-radius:999px;background:var(--hov2);color:var(--tx2);font-size:11px;font-weight:800;padding:4px 9px;cursor:pointer}
+.vdl{flex:none;width:28px;height:28px;padding:0;border:0;border-radius:50%;background:transparent;color:var(--tx2);display:grid;place-items:center;cursor:pointer}
+.vdl:hover{background:var(--hov2);color:var(--hi)}
+#upd{position:fixed;left:50%;top:calc(10px + var(--sat));transform:translateX(-50%);z-index:220;display:flex;align-items:center;gap:10px;max-width:92vw;padding:9px 10px 9px 18px;border-radius:999px;background:var(--grad);color:#fff;font-weight:700;font-size:14px;box-shadow:0 8px 30px #0007}
+#upd button{border:0;cursor:pointer;border-radius:999px;font-weight:800}
+#upd .go{background:#fff;color:#222;padding:7px 15px}
+#upd .x{background:#fff3;color:#fff;width:30px;height:30px;padding:0;display:grid;place-items:center}
+@media(max-width:820px){.bdown{right:10px}}
 </style>
 
 <div id=auth>
@@ -2241,6 +2485,7 @@ body.big button{min-height:44px}
   <div id=stampbox hidden></div>
   <div id=ronote class=muted hidden style="text-align:center;padding:14px">公式アナウンスはオーナーだけが投稿できます</div>
   <div id=bar>
+   <button id=bdown class=bdown onclick="toBottom(true)" hidden></button>
    <button id=bclip class=ghost onclick="f.click()"></button>
    <button id=bstamp class=ghost onclick="toggleStamps()"></button>
    <div class=field>
@@ -2301,7 +2546,9 @@ const IC={
  zoomin:'<circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4M11 8v6M8 11h6"/>',
  zoomout:'<circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4M8 11h6"/>',
  chev:'<path d="M6 9l6 6 6-6"/>',
- logout:'<path d="M9 4H5a1 1 0 0 0-1 1v14a1 1 0 0 0 1 1h4M16 8l4 4-4 4M20 12H9"/>'
+ logout:'<path d="M9 4H5a1 1 0 0 0-1 1v14a1 1 0 0 0 1 1h4M16 8l4 4-4 4M20 12H9"/>',
+ play:'<path d="M7 4.5v15l12-7.5z"/>',pause:'<path d="M8 5v14M16 5v14"/>',
+ refresh:'<path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/>'
 };
 const ic=(n,s=18)=>`<svg class="svg" width="${s}" height="${s}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${IC[n]}</svg>`;
 const ico=(n,s)=>el("span","ico",ic(n,s));
@@ -2400,6 +2647,7 @@ function initIcons(){
   $("navbtn").innerHTML=ic("menu",22);$("membtn").innerHTML=ic("users",20);$("gearb").innerHTML=ic("gear",19);$("gearb").title="設定";$("annb").innerHTML=ic("speaker",19);$("annb").title="公式アナウンス";
   $("bclip").innerHTML=ic("clip",21);$("bclip").title="ファイルを送信";$("bstamp").innerHTML=ic("sticker",21);$("bstamp").title="スタンプ";
   $("bemoji").innerHTML=ic("smile",21);$("bemoji").title="絵文字";
+  $("bdown").innerHTML=ic("chev",22)+'<span class=bdn hidden></span>';$("bdown").title="一番下へ";
   $("bsend").innerHTML=ic("send",18)+'<span class="lbl">送信</span>';$("bsend").title="送信";
   $("hangb").innerHTML=ic("hangup",22);$("hangb").title="通話を終了";$("micc").innerHTML=ic("chev",14);$("micc").title="マイクを選ぶ";$("camc").innerHTML=ic("chev",14);$("camc").title="カメラを選ぶ";
   $("profbtn").innerHTML=ic("user",20);$("profbtn").title="プロフィール";$("sqb").innerHTML=ic("search",18);$("sqb").title="検索";$("navbtn").title="メニュー";$("membtn").title="メンバー";
@@ -2440,7 +2688,7 @@ function connect(){
   const old=S.ws;
   const w=new WebSocket(`${location.protocol==="https:"?"wss":"ws"}://${location.host}/ws?token=${S.token}`);
   S.ws=w;if(old)old.close();
-  w.onopen=()=>{if(S.chan)openChan(S.chan,true)};
+  w.onopen=()=>{checkUpdate();if(S.chan)openChan(S.chan,true)};
   w.onclose=()=>{if(S.ws===w&&S.token){if(call)leaveCall(true);setTimeout(connect,2000)}};
   w.onmessage=onEvent;
 }
@@ -2450,7 +2698,10 @@ function onEvent(e){
   else if(d.type==="message"){
     const m=d.message;if(TY[m.channel]){delete TY[m.channel][m.user];tyDraw()}
     if(m.channel===S.chan){
-      addMsg(m);$("msgs").scrollTop=1e9;
+      const mine=!!S.me&&m.user===S.me.name,near=msgsNearBottom();
+      addMsg(m);
+      /* 自分の送信 / すでに一番下を見ているときだけ追従。読み返し中は動かさず、ボタンに新着数を出す */
+      if(mine||near)toBottom(false);else{S.below=(S.below||0)+1;updDown()}
       if(document.hidden||!document.hasFocus()){S.unread[m.channel]=1;updateTitle()}
     }else{
       S.unread[m.channel]=1;
@@ -2631,16 +2882,110 @@ function emojiEl(v){
   if(m&&S.emap[m[1]]){const i=el("img","cemoji");i.src=`/api/emojis/${S.emap[m[1]]}/img?token=${S.token}`;i.alt=v;i.title=v;return i}
   const s=el("span","uemoji");s.textContent=v;return s;
 }
+function cleanUrl(u){
+  for(;;){
+    const c=u.slice(-1);
+    if(/[.,;:!?\]]/.test(c)){u=u.slice(0,-1);continue}
+    if(c===")"&&(u.match(/\(/g)||[]).length<(u.match(/\)/g)||[]).length){u=u.slice(0,-1);continue}
+    return u;
+  }
+}
+const URL_RE=/https?:\/\/[\w\-.~:\/?#\[\]@!$&()*+,;=%]+/;
 function renderText(box,text){
   let n=0,custom=0;
-  text.split(/(@[^\s@]+|:[a-z0-9_]{2,12}:)/).forEach(p=>{
+  text.split(/(https?:\/\/[\w\-.~:\/?#\[\]@!$&()*+,;=%]+|@[^\s@]+|:[a-z0-9_]{2,12}:)/).forEach(p=>{
     if(!p)return;
-    if(p[0]==="@"&&p.length>1){const s=el("span","mention"+(p.slice(1)===S.me.name?" me":""));s.textContent=p;box.append(s);n++}
+    if(/^https?:\/\//.test(p)){
+      const u=cleanUrl(p),tail=p.slice(u.length);
+      const a=el("a","lnk");a.href=u;a.target="_blank";a.rel="noopener noreferrer nofollow";a.textContent=u;
+      box.append(a);if(tail)box.append(tail);n+=2;
+    }
+    else if(p[0]==="@"&&p.length>1){const s=el("span","mention"+(p.slice(1)===S.me.name?" me":""));s.textContent=p;box.append(s);n++}
     else if(/^:[a-z0-9_]{2,12}:$/.test(p)&&S.emap[p.slice(1,-1)]){box.append(emojiEl(p));custom++;n++}
     else{box.append(p);if(p.trim())n+=2}
   });
   if(custom===1&&n===1)box.classList.add("jumbo");
 }
+/* ---------- URLの埋め込み (リンクプレビュー) ---------- */
+const LP=new Map();
+const lpImg=u=>"/api/linkimg?url="+encodeURIComponent(u)+"&token="+encodeURIComponent(S.token);
+function getPreview(url){
+  if(!LP.has(url))LP.set(url,fetch("/api/linkpreview?url="+encodeURIComponent(url),{headers:{Authorization:"Bearer "+S.token}})
+    .then(r=>r.ok?r.json():{ok:false}).catch(()=>({ok:false})));
+  return LP.get(url);
+}
+function lpCard(pv,url){
+  const a=el("a","lpc"),href=/^https?:\/\//.test(pv.url||"")?pv.url:url;
+  a.href=href;a.target="_blank";a.rel="noopener noreferrer nofollow";
+  if(pv.kind==="image"){
+    a.classList.add("lpimg");
+    const im=el("img");im.alt="";im.loading="lazy";im.src=lpImg(pv.image);im.onerror=()=>a.remove();a.append(im);
+    return a;
+  }
+  if(pv.site){const s=el("div","lps");s.textContent=pv.site;a.append(s)}
+  const h=el("div","lph");h.textContent=pv.title||href;a.append(h);
+  if(pv.desc){const d=el("div","lpd");d.textContent=pv.desc;a.append(d)}
+  if(pv.image){const im=el("img","lpi");im.alt="";im.loading="lazy";im.src=lpImg(pv.image);im.onerror=()=>im.remove();a.append(im)}
+  return a;
+}
+function attachPreview(box,text){
+  const x=URL_RE.exec(text||"");if(!x)return;
+  const url=cleanUrl(x[0]),ph=el("div","lpw");box.append(ph);
+  getPreview(url).then(pv=>{
+    if(!pv||!pv.ok)return;
+    const near=msgsNearBottom();
+    ph.append(lpCard(pv,url));
+    if(near&&$("msgs").contains(ph))toBottom(false);
+  });
+}
+
+/* ---------- ボイスメッセージのプレイヤー ---------- */
+let curAu=null;
+function fmtT(s){if(!isFinite(s)||s<0)s=0;s=Math.round(s);return Math.floor(s/60)+":"+String(s%60).padStart(2,"0")}
+function voiceEl(m,url){
+  const w=el("div","vp"),au=new Audio();au.preload="metadata";au.src=url;
+  const pb=el("button","vpb",ic("play",20));pb.type="button";pb.title="再生";
+  const col=el("div","vcol"),wave=el("div","vwave"),meta=el("div","vmeta");
+  const N=matchMedia("(max-width:520px)").matches?28:38;
+  let seed=0;for(const ch of String(m.file_id||m.id))seed=(seed*31+ch.charCodeAt(0))>>>0;
+  const rnd=()=>{seed=(seed*1664525+1013904223)>>>0;return seed/4294967296};
+  const bars=[];for(let i=0;i<N;i++){const b=el("i");b.style.height=Math.round(20+rnd()*70)+"%";wave.append(b);bars.push(b)}
+  const tm=el("span","vt");tm.textContent="0:00";
+  const sp=el("button","vsp","1×");sp.type="button";sp.title="再生速度";
+  const dl=ibtn("download","",()=>downloadFile(m),"vdl","ダウンロード");
+  let dur=0,drag=false,raf=0;
+  const total=()=>isFinite(au.duration)&&au.duration>0?au.duration:dur;
+  const paint=()=>{
+    const t=total(),p=t?au.currentTime/t:0,on=Math.round(p*N);
+    bars.forEach((b,i)=>b.classList.toggle("on",i<on));
+    tm.textContent=(!au.paused||au.currentTime>0)?fmtT(au.currentTime)+" / "+fmtT(t):fmtT(t);
+  };
+  const tick=()=>{paint();if(!au.paused)raf=requestAnimationFrame(tick)};
+  au.onloadedmetadata=()=>{
+    if(!isFinite(au.duration)){ /* 録音データは長さが無限と出ることがあるので、末尾へ飛ばして長さを求める */
+      const fix=()=>{au.removeEventListener("timeupdate",fix);dur=au.duration;au.currentTime=0;paint()};
+      au.addEventListener("timeupdate",fix);au.currentTime=1e7;
+    }else{dur=au.duration;paint()}
+  };
+  au.ondurationchange=()=>{if(isFinite(au.duration)){dur=au.duration;paint()}};
+  au.onplay=()=>{pb.innerHTML=ic("pause",20);pb.title="一時停止";w.classList.add("play");cancelAnimationFrame(raf);tick()};
+  au.onpause=()=>{pb.innerHTML=ic("play",20);pb.title="再生";w.classList.remove("play");paint()};
+  au.onended=()=>{au.currentTime=0;paint()};
+  au.onerror=()=>{tm.textContent="読み込めませんでした"};
+  pb.onclick=()=>{
+    if(au.paused){if(curAu&&curAu!==au)curAu.pause();curAu=au;au.play().catch(()=>toast("再生できませんでした"))}
+    else au.pause();
+  };
+  const rates=[1,1.5,2,0.75];
+  sp.onclick=()=>{const r=rates[(rates.indexOf(au.playbackRate)+1)%rates.length];au.playbackRate=r;sp.textContent=r+"×"};
+  const seek=e=>{const t=total();if(!t)return;const r=wave.getBoundingClientRect();au.currentTime=Math.min(1,Math.max(0,(e.clientX-r.left)/r.width))*t;paint()};
+  wave.onpointerdown=e=>{wave.setPointerCapture(e.pointerId);drag=true;seek(e)};
+  wave.onpointermove=e=>{if(drag)seek(e)};
+  wave.onpointerup=wave.onpointercancel=()=>{drag=false};
+  meta.append(tm,sp,dl);col.append(wave,meta);w.append(pb,col);
+  return w;
+}
+
 function jumpTo(id){
   const t=document.querySelector(`[data-mid="${id}"]`);
   if(t){t.scrollIntoView({block:"center"});t.classList.add("flash");setTimeout(()=>t.classList.remove("flash"),1400)}
@@ -2713,13 +3058,14 @@ function buildMsg(m,grouped){
     const p=el("div","mt");renderText(p,m.text);
     if(m.edited){const e=el("small","edited");e.textContent="編集済み";p.append(e)}
     body.append(p);
+    attachPreview(body,m.text);
   }
   if(m.stamp){const i=el("img","stamp");i.alt="スタンプ";i.src=`/api/stamps/${m.stamp}/img?token=${S.token}`;body.append(i)}
   if(m.file_id){
     const url=`/files/${m.file_id}?token=${S.token}`,ty=m.file_type||"";let e;
     if(ty.startsWith("video/")){e=el("video");e.controls=true;e.preload="metadata";e.playsInline=true;e.src=url}
     else if(ty.startsWith("image/")){e=el("img","pic");e.src=url;e.title="クリックで拡大";e.onclick=()=>openLightbox(m,url)}
-    else if(ty.startsWith("audio/")){e=el("div","vmsg");const au=el("audio");au.controls=true;au.preload="metadata";au.src=url;e.append(au)}
+    else if(ty.startsWith("audio/")){e=voiceEl(m,url)}
     else{e=el("a","fileln");e.href=dlUrl(m);e.download=m.file_name||"file";e.append(ico("download",18));const s=el("span");s.textContent=m.file_name;e.append(s)}
     body.append(e);
     if(ty.startsWith("video/")||ty.startsWith("image/")){
@@ -3674,6 +4020,7 @@ async function drawMembers(){
   });
 }
 async function openChan(cid,auto){
+  const keepPos=!!auto&&S.chan===cid,prevTop=$("msgs").scrollTop,wasNear=msgsNearBottom();
   S.chan=cid;S.unread[cid]=0;S.ment[cid]=0;last=null;clearReply();
   if(!auto)closeDrawers();
   drawList();
@@ -3691,10 +4038,14 @@ async function openChan(cid,auto){
   const ro=isA&&!S.owner;$("bar").hidden=ro;$("ronote").hidden=!ro;$("stampbox").hidden=true;
   updateCallBtn();
   if(S.view==="dm")drawMembers();
+  if(curAu){curAu.pause();curAu=null}
   $("msgs").innerHTML="";
   const d=await T(()=>api(`/api/channels/${cid}/messages`));
   if(!d||S.chan!==cid)return;
-  d.messages.forEach(addMsg);$("msgs").scrollTop=1e9;
+  d.messages.forEach(addMsg);
+  /* 読み返し中の自動更新 (再接続など) では今の位置を保つ。チャットを開いたときだけ一番下へ */
+  if(keepPos&&!wasNear){$("msgs").scrollTo({top:prevTop,behavior:"instant"});S.stick=false;updDown()}
+  else{S.stick=true;toBottom(false)}
 }
 
 /* ---------- 設定画面 (ディスコード風) ---------- */
@@ -3814,7 +4165,8 @@ function settingsModal(page){
       c.append(sRow("アプリを再読み込み","表示がおかしいときに",ibtn("compress","再読み込み",()=>location.reload(),"ghost")));
     },
     about(c){
-      c.append(sRow("Motto","バージョン 5",null));
+      c.append(sRow("Motto","バージョン 5 (build "+APP_V+")",null));
+      c.append(sRow("アップデート","新しいバージョンが公開されているか確認します。あるときは画面の上に通知が出ます。",ibtn("refresh","確認",()=>checkUpdate(true),"ghost rm")));
       c.append(sRow("ホーム画面に追加","スマホではブラウザのメニューから「ホーム画面に追加」するとアプリのように使えます",null));
       c.append(sRow("キーボード","Enter: 送信 / Ctrl+V: 画像を貼り付け / Esc: 閉じる",null));
     }
@@ -3948,6 +4300,49 @@ async function pasteFromClipboard(){
 const bpaste=ibtn("copy","",pasteFromClipboard,"ghost","クリップボードから貼り付け");bpaste.id="bpaste";
 $("bclip").after(bpaste);
 
+/* ---------- 一番下へボタン / スクロール ---------- */
+S.stick=true;S.below=0;
+function msgsNearBottom(){const m=$("msgs");return m.scrollHeight-m.scrollTop-m.clientHeight<80}
+function updDown(){
+  const b=$("bdown");if(!b)return;
+  const far=!msgsNearBottom(),n=S.below||0,bd=b.querySelector(".bdn");if(!bd)return;
+  b.hidden=!far;b.classList.toggle("new",n>0);
+  bd.hidden=!n;bd.textContent=n>99?"99+":String(n);
+}
+function toBottom(smooth){
+  const m=$("msgs");S.below=0;S.stick=true;
+  m.scrollTo({top:m.scrollHeight,behavior:smooth?"smooth":"instant"});
+  updDown();
+}
+$("msgs").addEventListener("scroll",()=>{S.stick=msgsNearBottom();if(S.stick)S.below=0;updDown()},{passive:true});
+/* 画像・動画・埋め込みが後から読み込まれても、一番下を見ていたなら位置がずれないようにする */
+["load","loadedmetadata"].forEach(t=>$("msgs").addEventListener(t,()=>{if(S.stick)toBottom(false)},true));
+
+/* ---------- アップデート通知 ---------- */
+const APP_V="__APP_VERSION__";
+let updSnooze=0;
+async function checkUpdate(manual){
+  if(!manual&&Date.now()<updSnooze)return false;
+  try{
+    const r=await fetch("/api/version",{cache:"no-store"});
+    if(!r.ok)throw new Error("x");
+    const d=await r.json();
+    if(d.v&&d.v!==APP_V){showUpdate();return true}
+    if(manual)toast("最新のバージョンです");
+  }catch(e){if(manual)toast("更新を確認できませんでした")}
+  return false;
+}
+function showUpdate(){
+  if($("upd"))return;
+  const b=el("div");b.id="upd";
+  const t=el("span");t.textContent="新しいバージョンがあります";
+  const go=el("button","go");go.textContent="更新";go.onclick=()=>location.reload();
+  const x=el("button","x",ic("x",16));x.title="あとで";x.onclick=()=>{updSnooze=Date.now()+30*60e3;b.remove()};
+  b.append(t,go,x);document.body.append(b);
+}
+setInterval(()=>checkUpdate(),5*60e3);
+document.addEventListener("visibilitychange",()=>{if(!document.hidden)checkUpdate()});
+
 applyPrefs();
 applyTheme();
 initIcons();
@@ -3955,9 +4350,19 @@ if(S.token)boot();
 </script>"""
 
 
+# コードが変わる (= 新しくデプロイされる) と変わる。再起動しただけでは変わらない
+APP_VERSION = hashlib.sha1(PAGE.encode("utf-8")).hexdigest()[:10]
+_PAGE_OUT = PAGE.replace("__APP_VERSION__", APP_VERSION)
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    return PAGE
+    return HTMLResponse(_PAGE_OUT, headers={"Cache-Control": "no-cache"})
+
+
+@app.get("/api/version")
+async def app_version():
+    return JSONResponse({"v": APP_VERSION}, headers={"Cache-Control": "no-store"})
 
 
 if __name__ == "__main__":
