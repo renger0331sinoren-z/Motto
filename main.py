@@ -99,6 +99,11 @@ MIGRATIONS = [  # 古いDB(v2/v3)からの移行
     ("channels", "kind", "text default 'text'"),
     ("channels", "owner_id", "integer"),
     ("users", "friend_code", "text"),
+    ("users", "totp_secret", "text"),
+    ("users", "totp_pending", "text"),
+    ("users", "totp_on", "integer default 0"),
+    ("users", "totp_last", "integer default 0"),
+    ("users", "totp_backup", "text"),
     ("users", "notify_mode", "text default 'mention'"),
     ("servers", "is_public", "integer default 0"),
     ("users", "bio", "text"),
@@ -406,12 +411,150 @@ def _bootstrap_code():
         print("アップデートの確認に失敗:", e)
 
 
+OFFICIAL_NAME = "Motto公式"
+_OFFICIAL = {"id": None}
+
+# 機能の一覧。アップデートのお知らせは、ここの変化から自動で書かれます。
+# 機能を足す・変えるときは、ここに1行足す(直す)だけで、お知らせに載ります。 (カテゴリ, 識別名, 名前, 説明)
+FEATURES = [
+    ("メッセージ", "text", "テキストチャット", "メッセージの送信・返信・編集・削除ができます。"),
+    ("メッセージ", "files", "ファイル送信", "画像・動画・ファイルを、容量の制限なしで送れます。"),
+    ("メッセージ", "paste", "画像の貼り付け", "スクリーンショットを Ctrl+V で貼り付けて送れます。スマホは貼り付けボタンから送れます。"),
+    ("メッセージ", "voicemsg", "ボイスメッセージ", "マイクで録音して、音声メッセージを送れます。"),
+    ("メッセージ", "typing", "入力中の表示", "相手がメッセージを入力している間、「○○ が入力中」と表示されます。"),
+    ("メッセージ", "reactions", "リアクション・スタンプ・オリジナル絵文字", "メッセージに絵文字で反応できます。自分の画像でスタンプや絵文字も作れます。"),
+    ("メッセージ", "search", "メッセージ検索", "チャンネルの中のメッセージを検索できます。"),
+    ("メッセージ", "linkpreview", "リンクのプレビュー", "送られたリンクのタイトルや画像をその場で表示します。"),
+    ("通話", "voice", "ボイスチャンネルとDM通話", "サーバーのボイスチャンネルや、DM・グループから通話できます。"),
+    ("通話", "video", "ビデオ通話と画面共有", "カメラや画面を映して通話できます。スマホではインカメラとアウトカメラを切り替えられます。"),
+    ("通話", "speaking", "話している人の表示", "通話中に話している人のアイコンが、緑の輪で囲まれます。"),
+    ("友達とグループ", "friends", "フレンド", "フレンドコードで友達を追加して、DMを送れます。"),
+    ("友達とグループ", "groups", "グループ", "3人以上でチャットや通話ができるグループを作れます。"),
+    ("友達とグループ", "block", "ブロックとミュート", "苦手な相手をブロックしたり、その人からの通知だけをミュートしたりできます。"),
+    ("サーバー", "servers", "サーバー", "自分のサーバーを作り、招待コードで友達を呼べます。公開サーバーを探して参加することもできます。"),
+    ("サーバー", "roles", "ロールと権限", "ロールを作って、メンバーごとにできることを決められます。"),
+    ("プロフィール", "profile", "プロフィール", "アイコン・名前・自己紹介を設定できます。アイコンは写す範囲を選べます。"),
+    ("プロフィール", "banner", "バナーと背景", "プロフィールに画像や動画のバナー・背景を設定できます。容量の制限はありません。"),
+    ("通知と安全", "notify", "通知", "ブラウザ通知とPush通知で、アプリを閉じていてもお知らせが届きます。通知の対象も選べます。"),
+    ("通知と安全", "twofa", "二段階認証", "認証アプリの6桁のコードを使って、アカウントをより安全に守れます。"),
+    ("通知と安全", "persist", "データの保存", "外部データベースに保存でき、アップデートしてもアカウントやファイルが消えません。"),
+    ("アプリ", "settings", "設定", "外観・チャット・通知・音声・アクセシビリティなど、たくさんの項目を細かく設定できます。"),
+    ("アプリ", "mobile", "スマホ対応", "スマホ用の画面に対応していて、ホーム画面に追加するとアプリのように使えます。戻るボタンで前の画面に戻れます。"),
+    ("アプリ", "update", "公式アナウンスとアップデート", "アップデートの内容は公式アナウンスに自動で届きます。バージョンは設定から確認できます。"),
+]
+
+
+def _features_of(code):
+    """コード(文字列)から FEATURES を読み取る。読めなければ None"""
+    import ast
+    try:
+        for n in ast.parse(code).body:
+            if isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "FEATURES" for t in n.targets):
+                return [tuple(x) for x in ast.literal_eval(n.value)]
+    except Exception:  # noqa
+        pass
+    return None
+
+
+def _setting_cats_of(code):
+    m = re.search(r"const SET_CATS=\[(.*?)\];", code, re.S)
+    return dict(re.findall(r'\["(\w+)","\w+","([^"]+)"\]', m.group(1))) if m else {}
+
+
+def initial_release_text():
+    out = [f"Motto {ver_str((1, 0, 0))} をリリースしました", "",
+           "Mottoへようこそ。みんなともっと楽しい時間を過ごせるチャットアプリです。", "こんな機能があります。", ""]
+    cats = []
+    for c, *_ in FEATURES:
+        if c not in cats:
+            cats.append(c)
+    for c in cats:
+        out.append(f"【{c}】")
+        out += [f"・{t}: {d}" for cc, _i, t, d in FEATURES if cc == c]
+        out.append("")
+    out.append("困ったことや、ほしい機能があれば、運営まで気軽に伝えてください。")
+    return "\n".join(out)[:3800]
+
+
+def build_update_notes(old_code, new_code, version, extra=""):
+    """前のコードと新しいコードを見比べて、アップデートのお知らせを自動で書く"""
+    old, new = _features_of(old_code) or [], _features_of(new_code) or []
+    od = {x[1]: x for x in old}
+    nd = {x[1]: x for x in new}
+    added = [nd[k] for k in nd if k not in od]
+    changed = [nd[k] for k in nd if k in od and (od[k][2], od[k][3]) != (nd[k][2], nd[k][3])]
+    removed = [od[k] for k in od if k not in nd]
+    oc, nc = _setting_cats_of(old_code), _setting_cats_of(new_code)
+    out = [f"Motto {version} アップデートのお知らせ", ""]
+    if added:
+        out.append("【追加された機能】")
+        out += [f"・{t}: {d}" for _c, _i, t, d in added]
+        out.append("")
+    if changed:
+        out.append("【よくなったところ】")
+        out += [f"・{t}: {d}" for _c, _i, t, d in changed]
+        out.append("")
+    if removed:
+        out.append("【終了した機能】")
+        out += [f"・{t}" for _c, _i, t, _d in removed]
+        out.append("")
+    new_cats = [v for k, v in nc.items() if k not in oc]
+    if new_cats:
+        out.append("【設定】")
+        out.append("設定に次の項目が増えました: " + "、".join(f"「{x}」" for x in new_cats))
+        out.append("")
+    if not (added or changed or removed or new_cats):
+        out += ["細かな改善と、不具合の修正を行いました。", ""]
+    if extra:
+        out += ["【運営からのひとこと】", extra, ""]
+    out.append("(アップデートのため、数秒間つながらなくなります。自動で再接続されます)")
+    return "\n".join(out)[:3800]
+
+
+def official_id():
+    if _OFFICIAL["id"]:
+        return _OFFICIAL["id"]
+    r = db.execute("select id from users where name=?", (OFFICIAL_NAME,)).fetchone()
+    _OFFICIAL["id"] = r[0] if r else None
+    return _OFFICIAL["id"]
+
+
+def ensure_official():
+    """「Motto公式」アカウント (ログインできない / アイコンはMottoのロゴ) を用意する"""
+    r = db.execute("select id,avatar_file from users where name=?", (OFFICIAL_NAME,)).fetchone()
+    if not r:
+        salt = secrets.token_bytes(16)
+        uid = db.execute(
+            "insert into users(name,salt,pw,created,friend_code,bio) values(?,?,?,?,?,?)",
+            (OFFICIAL_NAME, salt, hash_pw(secrets.token_urlsafe(40), salt), time.time(), new_friend_code(),
+             "Mottoの公式アカウントです。アップデートのお知らせなどを送ります。"),
+        ).lastrowid
+        db.commit()
+        r = (uid, None)
+    fid = r[1] or uuid.uuid4().hex
+    if not (UPLOADS / fid).exists():
+        (UPLOADS / fid).write_bytes(ICON512)
+        mirror_file(fid)
+    if not r[1]:
+        db.execute("update users set avatar_file=?,avatar_mime='image/png',avatar_ver=1 where id=?", (fid, r[0]))
+        db.commit()
+    _OFFICIAL["id"] = r[0]
+
+
 _bootstrap_code()
 
 
 @app.on_event("startup")
 async def _upd_started():
     _ukv_del("upd_pending")  # ここまで来れば起動成功
+    try:
+        ensure_official()
+        if not _ukv_get("release_posted"):
+            _ukv_set("release_posted", "1")
+            if ver_parts() == (1, 0, 0):  # 最初のリリース: 機能の紹介を公式アナウンスに出す
+                await post_message(official_id(), ANNOUNCE_CID, initial_release_text())
+    except Exception:  # noqa
+        traceback.print_exc()
 
 
 # 公式アナウンス用の特別なチャンネル (全員が読めて、オーナーだけが投稿できる)
@@ -738,9 +881,19 @@ async def register(b: dict):
 @app.post("/api/login")
 async def login(b: dict):
     name = str(b.get("name", "")).strip()
-    r = db.execute("select id,salt,pw from users where name=?", (name,)).fetchone()
+    r = db.execute("select id,salt,pw,totp_on from users where name=?", (name,)).fetchone()
     if not r or not hmac.compare_digest(hash_pw(str(b.get("password", "")), r[1]), r[2]):
         raise HTTPException(401, "名前またはパスワードが違います")
+    if r[3]:
+        otp = str(b.get("otp", "")).strip()
+        if not otp:
+            return {"need_otp": True}
+        if _otp_locked(r[0]):
+            raise HTTPException(429, "間違いが続いたので、10分ほどしてからもう一度試してください")
+        if not check_second_factor(r[0], otp):
+            _otp_failed(r[0])
+            raise HTTPException(401, "認証コードが違います")
+        _OTP_FAIL.pop(r[0], None)
     return {"token": new_session(r[0])}
 
 
@@ -816,7 +969,7 @@ async def me(u=Depends(current_user)):
     return {
         "user": u, "servers": servers, "dms": dms, "friend_code": code, "friends": friends, "blocked": blocked_list, "muted": muted_list, "calls": calls,
         "notify_mode": row[1] or "mention", "push_available": HAVE_PUSH,
-        "announce": ANNOUNCE_CID, "is_owner": is_site_owner(uid), "persistent": bool(DATABASE_URL), "app_version": ver_str(),
+        "announce": ANNOUNCE_CID, "is_owner": is_site_owner(uid), "persistent": bool(DATABASE_URL), "app_version": ver_str(), "twofa": _twofa_on(uid),
     }
 
 
@@ -968,8 +1121,8 @@ async def avatars(u=Depends(current_user)):
         "select name,avatar_ver from users where avatar_file is not null and ("
         "id=? or id in (select user_id from members where server_id in (select server_id from members where user_id=?)) "
         "or id in (select user_id from dm_members where channel_id in (select channel_id from dm_members where user_id=?)) "
-        "or id in (select friend_id from friends where user_id=?) or id=?)",
-        (uid, uid, uid, uid, site_owner_id() or -1),
+        "or id in (select friend_id from friends where user_id=?) or id=? or id=?)",
+        (uid, uid, uid, uid, site_owner_id() or -1, official_id() or -1),
     ).fetchall()
     return {"avatars": {r[0]: r[1] for r in rows}}
 
@@ -1080,6 +1233,148 @@ async def new_code(u=Depends(current_user)):
 
 
 
+
+# ------------------------------------------------------------------ 二段階認証 (TOTP: Google Authenticator などで使える6桁のコード)
+import struct
+
+_OTP_FAIL = {}
+
+
+def totp_code(secret, step):
+    key = base64.b32decode(secret + "=" * ((8 - len(secret) % 8) % 8))
+    h = hmac.new(key, struct.pack(">Q", step), hashlib.sha1).digest()
+    o = h[-1] & 15
+    return f"{(struct.unpack('>I', h[o:o + 4])[0] & 0x7FFFFFFF) % 1000000:06d}"
+
+
+def totp_verify(secret, code, last_step=0):
+    code = re.sub(r"\D", "", str(code))
+    if len(code) != 6:
+        return None
+    now = int(time.time() // 30)
+    for d in (0, -1, 1):
+        st = now + d
+        if st > last_step and hmac.compare_digest(totp_code(secret, st), code):
+            return st
+    return None
+
+
+def _otp_locked(uid):
+    rec = _OTP_FAIL.get(uid)
+    return bool(rec and rec[0] >= 5 and time.time() - rec[1] < 600)
+
+
+def _otp_failed(uid):
+    now = time.time()
+    rec = _OTP_FAIL.get(uid)
+    if not rec or now - rec[1] >= 600:
+        rec = [0, now]
+    rec[0] += 1
+    _OTP_FAIL[uid] = rec
+
+
+def _bh(code):
+    return hashlib.sha256(re.sub(r"[^0-9a-f]", "", str(code).lower()).encode()).hexdigest()
+
+
+def new_backup_codes():
+    codes = [f"{secrets.token_hex(2)}-{secrets.token_hex(2)}" for _ in range(10)]
+    return codes, json.dumps([_bh(c) for c in codes])
+
+
+def check_second_factor(uid, code):
+    r = db.execute("select totp_secret,totp_last,totp_backup from users where id=? and totp_on=1", (uid,)).fetchone()
+    if not r or not r[0]:
+        return False
+    st = totp_verify(r[0], code, r[1] or 0)
+    if st:
+        db.execute("update users set totp_last=? where id=?", (st, uid))
+        db.commit()
+        return True
+    norm = re.sub(r"[^0-9a-f]", "", str(code).lower())
+    if len(norm) == 8:
+        try:
+            lst = json.loads(r[2] or "[]")
+        except Exception:  # noqa
+            lst = []
+        h = _bh(norm)
+        if h in lst:
+            lst.remove(h)
+            db.execute("update users set totp_backup=? where id=?", (json.dumps(lst), uid))
+            db.commit()
+            return True
+    return False
+
+
+def _twofa_on(uid):
+    r = db.execute("select totp_on from users where id=?", (uid,)).fetchone()
+    return bool(r and r[0])
+
+
+def _pw_ok(uid, pw):
+    r = db.execute("select salt,pw from users where id=?", (uid,)).fetchone()
+    return bool(r and hmac.compare_digest(hash_pw(str(pw), r[0]), r[1]))
+
+
+@app.post("/api/2fa/setup")
+async def twofa_setup(u=Depends(current_user)):
+    if _twofa_on(u["id"]):
+        raise HTTPException(400, "すでに二段階認証がオンです")
+    secret = base64.b32encode(secrets.token_bytes(20)).decode().rstrip("=")
+    db.execute("update users set totp_pending=? where id=?", (secret, u["id"]))
+    db.commit()
+    from urllib.parse import quote
+    return {"secret": secret, "uri": f"otpauth://totp/Motto:{quote(u['name'])}?secret={secret}&issuer=Motto"}
+
+
+@app.post("/api/2fa/enable")
+async def twofa_enable(b: dict, u=Depends(current_user)):
+    r = db.execute("select totp_pending from users where id=?", (u["id"],)).fetchone()
+    if not r or not r[0]:
+        raise HTTPException(400, "先に設定を始めてください")
+    if _otp_locked(u["id"]):
+        raise HTTPException(429, "間違いが続いたので、しばらくしてからもう一度試してください")
+    st = totp_verify(r[0], b.get("code", ""))
+    if not st:
+        _otp_failed(u["id"])
+        raise HTTPException(400, "コードが違います。アプリに表示されている6桁を入れてください")
+    codes, hashed = new_backup_codes()
+    db.execute("update users set totp_secret=?,totp_pending=NULL,totp_on=1,totp_last=?,totp_backup=? where id=?", (r[0], st, hashed, u["id"]))
+    db.commit()
+    _OTP_FAIL.pop(u["id"], None)
+    return {"ok": True, "codes": codes}
+
+
+@app.post("/api/2fa/disable")
+async def twofa_disable(b: dict, u=Depends(current_user)):
+    if not _twofa_on(u["id"]):
+        raise HTTPException(400, "二段階認証はオフです")
+    if _otp_locked(u["id"]):
+        raise HTTPException(429, "間違いが続いたので、しばらくしてからもう一度試してください")
+    if not _pw_ok(u["id"], b.get("password", "")) or not check_second_factor(u["id"], b.get("code", "")):
+        _otp_failed(u["id"])
+        raise HTTPException(400, "パスワードまたはコードが違います")
+    db.execute("update users set totp_secret=NULL,totp_pending=NULL,totp_on=0,totp_last=0,totp_backup=NULL where id=?", (u["id"],))
+    db.commit()
+    _OTP_FAIL.pop(u["id"], None)
+    return {"ok": True}
+
+
+@app.post("/api/2fa/backup")
+async def twofa_backup(b: dict, u=Depends(current_user)):
+    if not _twofa_on(u["id"]):
+        raise HTTPException(400, "二段階認証はオフです")
+    if _otp_locked(u["id"]):
+        raise HTTPException(429, "間違いが続いたので、しばらくしてからもう一度試してください")
+    if not check_second_factor(u["id"], b.get("code", "")):
+        _otp_failed(u["id"])
+        raise HTTPException(400, "コードが違います")
+    codes, hashed = new_backup_codes()
+    db.execute("update users set totp_backup=? where id=?", (hashed, u["id"]))
+    db.commit()
+    return {"codes": codes}
+
+
 def _preflight(data):
     """新しいコードを別プロセスで読み込んでみて、起動できるか確かめる (本番のデータには触れない)"""
     with tempfile.TemporaryDirectory() as td:
@@ -1132,6 +1427,21 @@ async def admin_update_info(u=Depends(current_user)):
     }
 
 
+@app.post("/api/admin/update/preview")
+async def admin_update_preview(b: dict, u=Depends(current_user)):
+    _need_owner(u)
+    code = b.get("code")
+    if not isinstance(code, str) or len(code) < 1000:
+        raise HTTPException(400, "main.py のファイルを選んでください")
+    kind = b.get("bump") if b.get("bump") in ("patch", "minor", "major") else "patch"
+    try:
+        compile(code, "main.py", "exec")
+    except SyntaxError as e:
+        raise HTTPException(400, f"文法エラーがあります (行 {e.lineno}): {e.msg}")
+    nv = ver_str(ver_bump(ver_parts(), kind))
+    return {"version": nv, "notes": build_update_notes(SELF.read_text(encoding="utf-8", errors="replace"), code, nv, str(b.get("notes", "")).strip()[:1000])}
+
+
 @app.post("/api/admin/update")
 async def admin_update(b: dict, u=Depends(current_user)):
     _need_owner(u)
@@ -1139,7 +1449,7 @@ async def admin_update(b: dict, u=Depends(current_user)):
     if not isinstance(code, str) or len(code) < 1000 or len(code) > 12 * 1024 * 1024:
         raise HTTPException(400, "main.py のファイルを選んでください")
     kind = b.get("bump") if b.get("bump") in ("patch", "minor", "major") else "patch"
-    notes = str(b.get("notes", "")).strip()[:1500]
+    extra = str(b.get("notes", "")).strip()[:1000]
     try:
         compile(code, "main.py", "exec")
     except SyntaxError as e:
@@ -1169,8 +1479,8 @@ async def admin_update(b: dict, u=Depends(current_user)):
     _ukv_set("code_base", base)
     _ukv_set("app_ver", ".".join(map(str, new_ver)))
     _ukv_set("upd_pending", "0")
-    _log_update({"v": ver_str(new_ver), "ts": time.time(), "notes": notes, "by": u["name"]})
-    text = f"🆕 アップデート {ver_str(new_ver)}\n" + (notes or "機能の追加・不具合の修正を行いました。") + "\n\n(数秒間サーバーが再起動します。自動で再接続されます)"
+    text = build_update_notes(cur_bytes.decode("utf-8", "replace"), code, ver_str(new_ver), extra)
+    _log_update({"v": ver_str(new_ver), "ts": time.time(), "notes": text, "by": u["name"]})
     await post_message(u["id"], ANNOUNCE_CID, text)
     _write_self(data)
     asyncio.get_running_loop().call_later(1.5, _restart)
@@ -1191,7 +1501,7 @@ async def admin_rollback(u=Depends(current_user)):
     _ukv_set("app_ver", ".".join(map(str, ver)))
     _ukv_del("code_prev", "upd_pending")
     _log_update({"v": ver_str(ver), "ts": time.time(), "notes": f"{old_ver} から戻しました", "by": u["name"]})
-    await post_message(u["id"], ANNOUNCE_CID, f"⏪ {old_ver} から {ver_str(ver)} に戻しました。\n(数秒間サーバーが再起動します)")
+    await post_message(u["id"], ANNOUNCE_CID, f"Motto を {old_ver} から {ver_str(ver)} に戻しました。\n(数秒間つながらなくなります。自動で再接続されます)")
     _write_self(data)
     asyncio.get_running_loop().call_later(1.5, _restart)
     return {"ok": True, "version": ver_str(ver)}
@@ -1705,6 +2015,8 @@ async def push_offline(cid, msg, sender_id):
 
 
 async def post_message(uid, cid, text="", file=None, stamp=None, reply_to=None):
+    if cid == ANNOUNCE_CID:  # 公式アナウンスは、いつも「Motto公式」から届く
+        uid = official_id() or uid
     ensure_dm_allowed(uid, cid)
     if reply_to and not db.execute("select 1 from messages where id=? and channel_id=?", (reply_to, cid)).fetchone():
         reply_to = None
@@ -1777,7 +2089,7 @@ async def edit_message(mid: int, b: dict, u=Depends(current_user)):
     r = db.execute("select channel_id,user_id,stamp_id from messages where id=?", (mid,)).fetchone()
     if not r:
         raise HTTPException(404, "メッセージが見つかりません")
-    if r[1] != u["id"]:
+    if r[1] != u["id"] and not (r[0] == ANNOUNCE_CID and is_site_owner(u["id"]) and r[1] == official_id()):
         raise HTTPException(403, "自分のメッセージだけ編集できます")
     require(u["id"], r[0], P_SEND)
     if r[2]:
@@ -2659,6 +2971,7 @@ body.big button{min-height:44px}
 #upd .x{background:#fff3;color:#fff;width:30px;height:30px;padding:0;display:grid;place-items:center}
 @media(max-width:820px){.bdown{right:10px}}
 .setver{margin:10px 12px 0;font-size:12px;color:var(--tx2);text-align:center}
+.pvnotes{white-space:pre-wrap;background:var(--bg3);border:1px solid var(--line);border-radius:12px;padding:12px;font-size:13px;line-height:1.7;max-height:280px;overflow:auto;margin:10px 0;font-family:inherit}
 </style>
 
 <div id=auth>
@@ -2668,6 +2981,7 @@ body.big button{min-height:44px}
   <p class=muted>みんなともっと楽しい時間を</p>
   <input id=an placeholder="ユーザー名" autocomplete=username>
   <input id=ap type=password placeholder="パスワード (6文字以上)" autocomplete=current-password>
+  <input id=ao placeholder="認証コード (6桁) / バックアップコード" inputmode=text autocomplete=one-time-code hidden>
   <div id=aerr></div>
   <button class=btn onclick="doAuth('login')">ログイン</button>
   <button class=ghost onclick="doAuth('register')">新規登録</button>
@@ -2852,7 +3166,7 @@ function form(title,fields,ok="OK",pre=[]){
         f.options.forEach(([v,t])=>{const c=el("label","chk"),i=el("input");i.type="checkbox";i.checked=(f.value||[]).includes(v);c.append(i,t);w.append(c);boxes.push([v,i])});
         get[f.k]=()=>boxes.filter(b=>b[1].checked).map(b=>b[0]);
       }else{
-        const l=el("label");l.textContent=f.label;const i=el("input");i.value=f.value||"";i.placeholder=f.ph||"";
+        const l=el("label");l.textContent=f.label;const i=el("input");i.value=f.value||"";i.placeholder=f.ph||"";if(f.type==="password")i.type="password";
         i.onkeydown=e=>{if(e.key==="Enter"&&!e.isComposing)go.click()};get[f.k]=()=>i.value.trim();w.append(l,i);
       }
       return w;
@@ -2884,7 +3198,8 @@ function initIcons(){
 async function doAuth(kind){
   $("aerr").textContent="";
   try{
-    const d=await api("/api/"+kind,"POST",{name:$("an").value.trim(),password:$("ap").value});
+    const d=await api("/api/"+kind,"POST",{name:$("an").value.trim(),password:$("ap").value,otp:$("ao").hidden?"":$("ao").value.trim()});
+    if(d.need_otp){$("ao").hidden=false;$("ao").focus();$("aerr").textContent="認証アプリに表示されている6桁のコードを入れて、もう一度ログインを押してください";return}
     S.token=d.token;localStorage.token=d.token;await boot();
   }catch(e){$("aerr").textContent=e.message}
 }
@@ -2896,7 +3211,7 @@ async function logout(){
 async function load(){
   const d=await api("/api/me");
   S.me=d.user;S.servers=d.servers;S.dms=d.dms;S.friends=d.friends;S.blocked=d.blocked||[];S.mutedList=d.muted||[];S.quiet=new Set([...S.blocked,...S.mutedList].map(x=>x.name));S.code=d.friend_code;S.calls=d.calls||{};
-  S.persistent=!!d.persistent;S.appver=d.app_version||"";S.notify=d.notify_mode;S.push=d.push_available;S.announce=d.announce;S.owner=d.is_owner;
+  S.persistent=!!d.persistent;S.appver=d.app_version||"";S.twofa=!!d.twofa;S.notify=d.notify_mode;S.push=d.push_available;S.announce=d.announce;S.owner=d.is_owner;
   if(S.view!=="dm"&&!S.servers.find(s=>s.id===S.view))S.view="dm";
   const mi=$("meinfo");mi.innerHTML="";const nm=el("span");nm.textContent=S.me.name;mi.append(avatar(S.me.name,"av sm2"),nm);mi.style.cursor="pointer";mi.onclick=()=>profileModal(S.me.name);
   drawRail();drawList();drawMembers();drawRing();updateCallBtn();drawNbar();
@@ -4277,6 +4592,42 @@ async function openChan(cid,auto){
   else{S.stick=true;toBottom(false)}
 }
 
+
+/* ---------- 二段階認証 ---------- */
+function backupModal(codes){
+  const p=el("p","muted");p.textContent="バックアップコードです。認証アプリが使えなくなったとき、1つにつき1回だけログインに使えます。いま保存してください。この画面を閉じると、もう一度は表示されません。";
+  const box=el("div","code");box.style.whiteSpace="pre-line";box.textContent=codes.join("\n");
+  const row=el("div","row");
+  row.append(ibtn("copy","すべてコピー",()=>copyText(codes.join("\n")),"ghost"),ibtn("download","ファイルに保存",()=>{
+    const a=document.createElement("a");a.href=URL.createObjectURL(new Blob(["Motto バックアップコード\n\n"+codes.join("\n")+"\n"],{type:"text/plain"}));a.download="motto-backup-codes.txt";a.click();setTimeout(()=>URL.revokeObjectURL(a.href),2000);
+  },"ghost"));
+  const ok=el("button","btn","保存しました");ok.onclick=()=>{closeModal();settingsModal("acct")};
+  modal("バックアップコード",[p,box,row,ok]);
+}
+async function twofaSetup(){
+  const d=await T(()=>api("/api/2fa/setup","POST"));if(!d)return;
+  const p=el("p","muted");p.textContent="認証アプリ (Google Authenticator・Microsoft Authenticator・Authy など) を開き、「セットアップキーを入力」を選んで、下のキーを入れてください。スマホなら、下のボタンで認証アプリを直接開けることもあります。";
+  const k=el("div","code");k.textContent=d.secret.match(/.{1,4}/g).join(" ");k.style.userSelect="all";k.style.wordBreak="break-all";
+  const row=el("div","row");
+  const op=el("a","btn","認証アプリで開く");op.href=d.uri;op.style.textDecoration="none";
+  row.append(ibtn("copy","キーをコピー",()=>copyText(d.secret),"ghost"),op);
+  const w=el("div","fld"),l=el("label"),ci=el("input");l.textContent="アプリに表示された6桁のコード";ci.inputMode="numeric";ci.maxLength=7;ci.autocomplete="one-time-code";w.append(l,ci);
+  const go=el("button","btn","有効にする");
+  go.onclick=async()=>{const r=await T(()=>api("/api/2fa/enable","POST",{code:ci.value.trim()}));if(r){S.twofa=true;backupModal(r.codes)}};
+  ci.onkeydown=e=>{if(e.key==="Enter"&&!e.isComposing)go.click()};
+  modal("二段階認証を設定",[p,k,row,w,go]);
+}
+async function twofaDisable(){
+  const f=await form("二段階認証をオフにする",[{k:"password",label:"パスワード",type:"password"},{k:"code",label:"認証アプリのコード (またはバックアップコード)"}],"オフにする");
+  if(!f)return;
+  if(await T(()=>api("/api/2fa/disable","POST",f))){S.twofa=false;toast("二段階認証をオフにしました");settingsModal("acct")}
+}
+async function twofaBackup(){
+  const f=await form("バックアップコードを再発行",[{k:"code",label:"認証アプリのコード"}],"再発行する");
+  if(!f)return;
+  const r=await T(()=>api("/api/2fa/backup","POST",f));if(r)backupModal(r.codes);
+}
+
 /* ---------- 設定画面 (ディスコード風) ---------- */
 const sRow=(title,desc,ctl)=>{
   const r=el("div","srow"),t=el("div","st"),b=el("b");b.textContent=title;t.append(b);
@@ -4319,6 +4670,9 @@ function settingsModal(page){
       c.append(sRow("フレンドコードを再発行","古いコードは使えなくなります",ibtn("gear","再発行",async()=>{
         if(await confirmBox("古いコードは使えなくなります。再発行しますか？","再発行"))T(async()=>{await api("/api/friends/newcode","POST");await load();show("acct")});
       },"ghost")));
+      c.append(sHead("セキュリティ"));
+      c.append(S.twofa?sRow("二段階認証","オン。ログインのときに、認証アプリのコードも必要です",ibtn("shield","オフにする",twofaDisable,"danger")):sRow("二段階認証","オフ。認証アプリの6桁のコードで、アカウントをより安全に守ります",ibtn("shield","設定する",twofaSetup,"btn")));
+      if(S.twofa)c.append(sRow("バックアップコード","認証アプリが使えなくなったときの予備のコードです",ibtn("copy","再発行",twofaBackup,"ghost")));
       c.append(sRow("ログアウト","この端末からログアウトします",ibtn("logout","ログアウト",()=>{closeSettings();logout()},"danger")));
     },
     prof(c){
@@ -4396,16 +4750,23 @@ function settingsModal(page){
     },
     update(c){
       const nextV=k=>{const m=/(\d+)\.(\d+)\.(\d+)/.exec(S.appver||"");let a=+m[1],b=+m[2],p=+m[3];if(k==="major"){a++;b=0;p=0}else if(k==="minor"){b++;p=0}else p++;return `v${a}.${String(b).padStart(2,"0")}.${p}`};
-      c.append(sNote("管理者だけが使えます。新しい main.py を選んで「アップデートする」を押すと、サーバーが自動で入れ替わって再起動し、公式アナウンスにお知らせが届きます。入れ替える前に起動テストをして、動かないファイルは受け付けません。"));
+      c.append(sNote("管理者だけが使えます。新しい main.py を選ぶと、変わったところが自動でお知らせの文章になります。「アップデートする」を押すと、サーバーが自動で入れ替わって再起動し、公式アナウンスに「Motto公式」からお知らせが届きます。入れ替える前に起動テストをして、動かないファイルは受け付けません。"));
       c.append(sRow("いまのバージョン",S.appver,null));
       const fi=el("input");fi.type="file";fi.accept=".py";fi.hidden=true;
       const fl=el("div","muted");fl.textContent="ファイルはまだ選ばれていません";
-      fi.onchange=()=>{const f=fi.files[0];fl.textContent=f?f.name+" ("+(f.size/1024).toFixed(0)+" KB)":"ファイルはまだ選ばれていません"};
+      const pv=el("pre","pvnotes");pv.hidden=true;
+      const refreshPv=async()=>{
+        const f=fi.files[0];if(!f){pv.hidden=true;return}
+        pv.hidden=false;pv.textContent="内容を調べています…";
+        try{const code=await f.text();const r=await api("/api/admin/update/preview","POST",{code,bump:sel.value,notes:notes.value.trim()});pv.textContent="公式アナウンスには、次のように自動で書かれます\n\n"+r.notes}
+        catch(e){pv.textContent="確認できません: "+e.message}
+      };
+      fi.onchange=()=>{const f=fi.files[0];fl.textContent=f?f.name+" ("+(f.size/1024).toFixed(0)+" KB)":"ファイルはまだ選ばれていません";refreshPv()};
       const pick=el("button","ghost","ファイルを選ぶ");pick.onclick=()=>fi.click();
-      c.append(sRow("main.py をアップロード","更新したいファイルを選びます",pick),fi,fl);
-      const sel=sSelect([["patch","小さな修正 ("+S.appver+" → "+nextV("patch")+")"],["minor","機能の追加 ("+S.appver+" → "+nextV("minor")+")"],["major","大きな更新 ("+S.appver+" → "+nextV("major")+")"]],"patch",()=>{});
+      c.append(sRow("main.py をアップロード","更新したいファイルを選びます",pick),fi,fl,pv);
+      const sel=sSelect([["patch","小さな修正 ("+S.appver+" → "+nextV("patch")+")"],["minor","機能の追加 ("+S.appver+" → "+nextV("minor")+")"],["major","大きな更新 ("+S.appver+" → "+nextV("major")+")"]],"patch",()=>refreshPv());
       c.append(sRow("バージョンの上げ方","",sel));
-      const notes=el("textarea");notes.rows=4;notes.maxLength=1500;notes.placeholder="アップデートの内容 (公式アナウンスに載ります)\n例: ・グループ機能を追加 ・不具合を修正";
+      const notes=el("textarea");notes.rows=4;notes.maxLength=1500;notes.placeholder="運営からのひとこと (任意)。自動で書かれた内容の最後に付け足されます";notes.onchange=()=>refreshPv();
       notes.style.width="100%";notes.style.margin="12px 0";c.append(notes);
       const go=el("button","btn","アップデートする");
       go.onclick=async()=>{
