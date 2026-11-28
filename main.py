@@ -1,5 +1,5 @@
 """
-Motto v4  (FastAPI + WebSocket + WebRTC + SQLite)
+Motto v1.00.0  (FastAPI + WebSocket + WebRTC + SQLite)
 
 主な機能
   - アカウント / フレンド(コード招待) / サーバー(作成・参加・公開検索) / ロール / DM
@@ -303,6 +303,116 @@ def restore_blobs():
 
 
 restore_blobs()
+
+# ------------------------------------------------------------------ アップデート機能 (管理者が main.py をアップロードして更新)
+import subprocess
+import sys
+import tempfile
+
+SELF = Path(__file__).resolve()
+
+
+def _sha(b):
+    return hashlib.sha256(b).hexdigest()
+
+
+def _ukv_get(k, d=None):
+    r = db.execute("select v from kv where k=?", (k,)).fetchone()
+    return r[0] if r else d
+
+
+def _ukv_set(k, v):
+    db.execute("insert or replace into kv values(?,?)", (k, v))
+    db.commit()
+
+
+def _ukv_del(*ks):
+    for k in ks:
+        db.execute("delete from kv where k=?", (k,))
+    db.commit()
+
+
+def ver_parts():
+    try:
+        a, b, c = [int(x) for x in _ukv_get("app_ver", "1.0.0").split(".")]
+        return a, b, c
+    except Exception:  # noqa
+        return 1, 0, 0
+
+
+def ver_str(parts=None):
+    a, b, c = parts or ver_parts()
+    return f"v{a}.{b:02d}.{c}"
+
+
+def ver_bump(parts, kind):
+    a, b, c = parts
+    if kind == "major":
+        return a + 1, 0, 0
+    if kind == "minor":
+        return a, b + 1, 0
+    return a, b, c + 1
+
+
+def _write_self(data):
+    tmp = SELF.with_name(SELF.name + ".new")
+    tmp.write_bytes(data)
+    os.replace(tmp, SELF)
+
+
+def _restart():
+    print("アップデートのため再起動します...")
+    try:
+        argv = list(getattr(sys, "orig_argv", None) or [sys.executable] + sys.argv)
+        os.execv(sys.executable, argv)
+    except Exception as e:  # noqa
+        print("その場での再起動に失敗。プロセスを終了します (自動で再起動されます):", e)
+        os._exit(3)
+
+
+def _bootstrap_code():
+    """起動時: 管理者がアップロードした最新コードを(再デプロイ後でも)引き継ぐ。起動に失敗した更新は自動で元に戻す。"""
+    if os.environ.get("MOTTO_PREFLIGHT"):
+        return
+    try:
+        cur = _sha(SELF.read_bytes())
+        pend = _ukv_get("upd_pending")
+        if pend is not None:
+            prev = _ukv_get("code_prev")
+            if pend != "0" and prev and cur == _ukv_get("code_sha"):
+                print("更新後の起動に失敗したため、前のバージョンへ戻します")
+                data = prev.encode("utf-8")
+                _write_self(data)
+                _ukv_set("code_py", prev)
+                _ukv_set("code_sha", _sha(data))
+                _ukv_set("app_ver", _ukv_get("ver_prev", "1.0.0"))
+                _ukv_del("upd_pending", "code_prev")
+                _restart()
+                return
+            _ukv_set("upd_pending", "1")
+        stored = _ukv_get("code_py")
+        if not stored:
+            return
+        if cur == _ukv_get("code_sha"):
+            return
+        if cur == _ukv_get("code_base"):
+            print("管理者がアップロードした最新のコードで起動します")
+            _write_self(stored.encode("utf-8"))
+            _restart()
+        else:
+            print("新しいデプロイを検出。アップロード済みのコードは破棄しました")
+            _ukv_del("code_py", "code_sha", "code_base", "code_prev", "upd_pending")
+    except Exception as e:  # noqa
+        print("アップデートの確認に失敗:", e)
+
+
+_bootstrap_code()
+
+
+@app.on_event("startup")
+async def _upd_started():
+    _ukv_del("upd_pending")  # ここまで来れば起動成功
+
 
 # 公式アナウンス用の特別なチャンネル (全員が読めて、オーナーだけが投稿できる)
 _a = db.execute("select id from channels where kind='announce'").fetchone()
@@ -706,7 +816,7 @@ async def me(u=Depends(current_user)):
     return {
         "user": u, "servers": servers, "dms": dms, "friend_code": code, "friends": friends, "blocked": blocked_list, "muted": muted_list, "calls": calls,
         "notify_mode": row[1] or "mention", "push_available": HAVE_PUSH,
-        "announce": ANNOUNCE_CID, "is_owner": is_site_owner(uid), "persistent": bool(DATABASE_URL),
+        "announce": ANNOUNCE_CID, "is_owner": is_site_owner(uid), "persistent": bool(DATABASE_URL), "app_version": ver_str(),
     }
 
 
@@ -967,6 +1077,124 @@ async def new_code(u=Depends(current_user)):
     db.commit()
     await push([u["id"]], {"type": "refresh"})
     return {"code": code}
+
+
+
+def _preflight(data):
+    """新しいコードを別プロセスで読み込んでみて、起動できるか確かめる (本番のデータには触れない)"""
+    with tempfile.TemporaryDirectory() as td:
+        f = Path(td) / "motto_new.py"
+        f.write_bytes(data)
+        env = dict(os.environ, MOTTO_PREFLIGHT="1", DATA_DIR=str(Path(td) / "data"))
+        env.pop("DATABASE_URL", None)
+        code = (
+            "import importlib.util,sys\n"
+            "sp=importlib.util.spec_from_file_location('motto_new',sys.argv[1])\n"
+            "m=importlib.util.module_from_spec(sp)\n"
+            "sp.loader.exec_module(m)\n"
+            "assert hasattr(m,'app')\n"
+            "print('PREFLIGHT_OK')\n"
+        )
+        try:
+            r = subprocess.run([sys.executable, "-c", code, str(f)], cwd=td, env=env, capture_output=True, text=True, timeout=90)
+        except subprocess.TimeoutExpired:
+            return False, "テスト起動が90秒でタイムアウトしました"
+        if r.returncode != 0 or "PREFLIGHT_OK" not in r.stdout:
+            tail = (r.stderr or r.stdout).strip().splitlines()[-6:]
+            return False, "テスト起動に失敗しました (足りないライブラリは requirements.txt にも追加してください):\n" + "\n".join(tail)
+    return True, ""
+
+
+def _need_owner(u):
+    if not is_site_owner(u["id"]):
+        raise HTTPException(403, "管理者だけが使えます")
+
+
+def _log_update(entry):
+    try:
+        log = json.loads(_ukv_get("upd_log", "[]"))
+    except Exception:  # noqa
+        log = []
+    log.insert(0, entry)
+    _ukv_set("upd_log", json.dumps(log[:30], ensure_ascii=False))
+
+
+@app.get("/api/admin/update")
+async def admin_update_info(u=Depends(current_user)):
+    _need_owner(u)
+    try:
+        log = json.loads(_ukv_get("upd_log", "[]"))
+    except Exception:  # noqa
+        log = []
+    return {
+        "version": ver_str(), "log": log, "can_rollback": bool(_ukv_get("code_prev")),
+        "persistent": bool(DATABASE_URL), "writable": os.access(SELF.parent, os.W_OK),
+    }
+
+
+@app.post("/api/admin/update")
+async def admin_update(b: dict, u=Depends(current_user)):
+    _need_owner(u)
+    code = b.get("code")
+    if not isinstance(code, str) or len(code) < 1000 or len(code) > 12 * 1024 * 1024:
+        raise HTTPException(400, "main.py のファイルを選んでください")
+    kind = b.get("bump") if b.get("bump") in ("patch", "minor", "major") else "patch"
+    notes = str(b.get("notes", "")).strip()[:1500]
+    try:
+        compile(code, "main.py", "exec")
+    except SyntaxError as e:
+        raise HTTPException(400, f"文法エラーがあります (行 {e.lineno}): {e.msg}")
+    if "FastAPI(" not in code:
+        raise HTTPException(400, "Mottoの main.py ではないようです")
+    data = code.encode("utf-8")
+    cur_bytes = SELF.read_bytes()
+    if data == cur_bytes:
+        raise HTTPException(400, "いま動いているものと同じファイルです")
+    if not os.access(SELF.parent, os.W_OK):
+        raise HTTPException(500, "サーバー上の main.py を書き換えられません")
+    ok, err = await asyncio.to_thread(_preflight, data)
+    if not ok:
+        raise HTTPException(400, err)
+    cur_sha = _sha(cur_bytes)
+    base = (_ukv_get("code_base") or cur_sha) if (_ukv_get("code_py") and _ukv_get("code_sha") == cur_sha) else cur_sha
+    prev_ver, new_ver = ver_parts(), ver_bump(ver_parts(), kind)
+    try:
+        SELF.with_name(SELF.name + ".bak").write_bytes(cur_bytes)
+    except Exception:  # noqa
+        pass
+    _ukv_set("code_prev", cur_bytes.decode("utf-8", "replace"))
+    _ukv_set("ver_prev", ".".join(map(str, prev_ver)))
+    _ukv_set("code_py", code)
+    _ukv_set("code_sha", _sha(data))
+    _ukv_set("code_base", base)
+    _ukv_set("app_ver", ".".join(map(str, new_ver)))
+    _ukv_set("upd_pending", "0")
+    _log_update({"v": ver_str(new_ver), "ts": time.time(), "notes": notes, "by": u["name"]})
+    text = f"🆕 アップデート {ver_str(new_ver)}\n" + (notes or "機能の追加・不具合の修正を行いました。") + "\n\n(数秒間サーバーが再起動します。自動で再接続されます)"
+    await post_message(u["id"], ANNOUNCE_CID, text)
+    _write_self(data)
+    asyncio.get_running_loop().call_later(1.5, _restart)
+    return {"ok": True, "version": ver_str(new_ver)}
+
+
+@app.post("/api/admin/rollback")
+async def admin_rollback(u=Depends(current_user)):
+    _need_owner(u)
+    prev = _ukv_get("code_prev")
+    if not prev:
+        raise HTTPException(400, "戻せる前のバージョンがありません")
+    data = prev.encode("utf-8")
+    old_ver = ver_str()
+    ver = tuple(int(x) for x in _ukv_get("ver_prev", "1.0.0").split("."))
+    _ukv_set("code_py", prev)
+    _ukv_set("code_sha", _sha(data))
+    _ukv_set("app_ver", ".".join(map(str, ver)))
+    _ukv_del("code_prev", "upd_pending")
+    _log_update({"v": ver_str(ver), "ts": time.time(), "notes": f"{old_ver} から戻しました", "by": u["name"]})
+    await post_message(u["id"], ANNOUNCE_CID, f"⏪ {old_ver} から {ver_str(ver)} に戻しました。\n(数秒間サーバーが再起動します)")
+    _write_self(data)
+    asyncio.get_running_loop().call_later(1.5, _restart)
+    return {"ok": True, "version": ver_str(ver)}
 
 
 # ------------------------------------------------------------------ サーバー / チャンネル / ロール
@@ -2430,6 +2658,7 @@ body.big button{min-height:44px}
 #upd .go{background:#fff;color:#222;padding:7px 15px}
 #upd .x{background:#fff3;color:#fff;width:30px;height:30px;padding:0;display:grid;place-items:center}
 @media(max-width:820px){.bdown{right:10px}}
+.setver{margin:10px 12px 0;font-size:12px;color:var(--tx2);text-align:center}
 </style>
 
 <div id=auth>
@@ -2667,7 +2896,7 @@ async function logout(){
 async function load(){
   const d=await api("/api/me");
   S.me=d.user;S.servers=d.servers;S.dms=d.dms;S.friends=d.friends;S.blocked=d.blocked||[];S.mutedList=d.muted||[];S.quiet=new Set([...S.blocked,...S.mutedList].map(x=>x.name));S.code=d.friend_code;S.calls=d.calls||{};
-  S.persistent=!!d.persistent;S.notify=d.notify_mode;S.push=d.push_available;S.announce=d.announce;S.owner=d.is_owner;
+  S.persistent=!!d.persistent;S.appver=d.app_version||"";S.notify=d.notify_mode;S.push=d.push_available;S.announce=d.announce;S.owner=d.is_owner;
   if(S.view!=="dm"&&!S.servers.find(s=>s.id===S.view))S.view="dm";
   const mi=$("meinfo");mi.innerHTML="";const nm=el("span");nm.textContent=S.me.name;mi.append(avatar(S.me.name,"av sm2"),nm);mi.style.cursor="pointer";mi.onclick=()=>profileModal(S.me.name);
   drawRail();drawList();drawMembers();drawRing();updateCallBtn();drawNbar();
@@ -4063,6 +4292,7 @@ function sRange(min,max,step,val,fn,fmt){
   i.type="range";i.min=min;i.max=max;i.step=step;i.value=val;o.textContent=fmt(val);
   i.oninput=()=>{o.textContent=fmt(i.value);fn(Number(i.value))};w.append(i,o);return w;
 }
+const allCats=()=>S.owner?[...SET_CATS.slice(0,-1),["update","download","アップデート (管理者)"],SET_CATS[SET_CATS.length-1]]:SET_CATS;
 const SET_CATS=[["acct","user","マイアカウント"],["prof","pencil","プロフィール"],["appear","globe","外観"],["chat","send","チャット"],
   ["notif","bell","通知"],["block","shield","ブロック・ミュート"],["voice","mic","音声・ビデオ"],["access","zoomin","アクセシビリティ"],["data","shield","データ・保存"],["about","gear","アプリについて"]];
 function closeSettings(fromPop){
@@ -4164,8 +4394,51 @@ function settingsModal(page){
       },"ghost")));
       c.append(sRow("アプリを再読み込み","表示がおかしいときに",ibtn("compress","再読み込み",()=>location.reload(),"ghost")));
     },
+    update(c){
+      const nextV=k=>{const m=/(\d+)\.(\d+)\.(\d+)/.exec(S.appver||"");let a=+m[1],b=+m[2],p=+m[3];if(k==="major"){a++;b=0;p=0}else if(k==="minor"){b++;p=0}else p++;return `v${a}.${String(b).padStart(2,"0")}.${p}`};
+      c.append(sNote("管理者だけが使えます。新しい main.py を選んで「アップデートする」を押すと、サーバーが自動で入れ替わって再起動し、公式アナウンスにお知らせが届きます。入れ替える前に起動テストをして、動かないファイルは受け付けません。"));
+      c.append(sRow("いまのバージョン",S.appver,null));
+      const fi=el("input");fi.type="file";fi.accept=".py";fi.hidden=true;
+      const fl=el("div","muted");fl.textContent="ファイルはまだ選ばれていません";
+      fi.onchange=()=>{const f=fi.files[0];fl.textContent=f?f.name+" ("+(f.size/1024).toFixed(0)+" KB)":"ファイルはまだ選ばれていません"};
+      const pick=el("button","ghost","ファイルを選ぶ");pick.onclick=()=>fi.click();
+      c.append(sRow("main.py をアップロード","更新したいファイルを選びます",pick),fi,fl);
+      const sel=sSelect([["patch","小さな修正 ("+S.appver+" → "+nextV("patch")+")"],["minor","機能の追加 ("+S.appver+" → "+nextV("minor")+")"],["major","大きな更新 ("+S.appver+" → "+nextV("major")+")"]],"patch",()=>{});
+      c.append(sRow("バージョンの上げ方","",sel));
+      const notes=el("textarea");notes.rows=4;notes.maxLength=1500;notes.placeholder="アップデートの内容 (公式アナウンスに載ります)\n例: ・グループ機能を追加 ・不具合を修正";
+      notes.style.width="100%";notes.style.margin="12px 0";c.append(notes);
+      const go=el("button","btn","アップデートする");
+      go.onclick=async()=>{
+        const f=fi.files[0];if(!f){toast("main.py を選んでください");return}
+        if(!await confirmBox(`${nextV(sel.value)} に更新します。サーバーが数秒間再起動します。よろしいですか？`,"更新する"))return;
+        go.disabled=true;go.textContent="起動テスト中… (数十秒かかることがあります)";
+        const code=await f.text();
+        const d=await T(()=>api("/api/admin/update","POST",{code,bump:sel.value,notes:notes.value.trim()}));
+        if(!d){go.disabled=false;go.textContent="アップデートする";return}
+        go.textContent="再起動中…";toast(d.version+" に更新します。自動で再読み込みします");
+        let n=0;const iv=setInterval(async()=>{
+          if(++n>60){clearInterval(iv);location.reload();return}
+          try{const r=await fetch("/api/version",{cache:"no-store"});const j=await r.json();if(j.version===d.version&&j.v!==APP_V){clearInterval(iv);location.reload()}}catch(e){}
+        },1500);
+      };
+      c.append(go);
+      const hist=el("div");c.append(hist);
+      api("/api/admin/update").then(d=>{
+        if(!d.writable)c.prepend(sNote("サーバー上のファイルを書き換えられないため、この方法ではアップデートできません。","warn"));
+        c.append(sNote(d.persistent?"アップロードしたコードは外部データベースにも保存されるので、再起動しても引き継がれます。GitHubなどに新しいコードをデプロイしたときは、そちらが優先されます。":"外部データベース(DATABASE_URL)が未設定のため、サーバーが作り直されると元のコードに戻ります。GitHubのmain.pyも一緒に更新してください。",d.persistent?"ok":"warn"));
+        if(d.can_rollback)c.append(sRow("ひとつ前に戻す","更新後に不具合が出たとき",ibtn("compress","戻す",async()=>{
+          if(!await confirmBox("ひとつ前のバージョンに戻しますか？ サーバーが再起動します。","戻す"))return;
+          const r=await T(()=>api("/api/admin/rollback","POST"));if(r){toast(r.version+" に戻します");setTimeout(()=>location.reload(),6000)}
+        },"danger")));
+        if(d.log.length){const h=sHead("更新の履歴");c.append(h);d.log.forEach(x=>{
+          const r=el("div","srow"),t=el("div","st"),b=el("b"),sm=el("small");
+          b.textContent=x.v+"  ·  "+new Date(x.ts*1000).toLocaleString("ja-JP");sm.textContent=(x.notes||"")+(x.by?"  (by "+x.by+")":"");sm.style.whiteSpace="pre-wrap";
+          t.append(b,sm);r.append(t);c.append(r);
+        })}
+      }).catch(()=>{});
+    },
     about(c){
-      c.append(sRow("Motto","バージョン 5 (build "+APP_V+")",null));
+      c.append(sRow("Motto",(S.appver||"")+"  (build "+APP_V+")",null));
       c.append(sRow("アップデート","新しいバージョンが公開されているか確認します。あるときは画面の上に通知が出ます。",ibtn("refresh","確認",()=>checkUpdate(true),"ghost rm")));
       c.append(sRow("ホーム画面に追加","スマホではブラウザのメニューから「ホーム画面に追加」するとアプリのように使えます",null));
       c.append(sRow("キーボード","Enter: 送信 / Ctrl+V: 画像を貼り付け / Esc: 閉じる",null));
@@ -4174,11 +4447,12 @@ function settingsModal(page){
   function show(key){
     Object.entries(items).forEach(([k,b])=>b.classList.toggle("on",k===key));
     ov.dataset.view="detail";ov.dataset.page=key;
-    ct.textContent=SET_CATS.find(x=>x[0]===key)[2];
+    ct.textContent=allCats().find(x=>x[0]===key)[2];
     inner.innerHTML="";PAGES[key](inner);body.scrollTop=0;
   }
-  SET_CATS.forEach(([k,icn,t])=>{const b=el("button","sitem",ic(icn,18)+`<span>${t}</span>`);b.onclick=()=>show(k);items[k]=b;nav.append(b)});
-  nav.append(el("div","ssp"),ibtn("logout","ログアウト",()=>{closeSettings();logout()},"sitem dng"));
+  allCats().forEach(([k,icn,t])=>{const b=el("button","sitem",ic(icn,18)+`<span>${t}</span>`);b.onclick=()=>show(k);items[k]=b;nav.append(b)});
+  const vv=el("div","setver");vv.textContent="Motto "+(S.appver||"");
+  nav.append(el("div","ssp"),ibtn("logout","ログアウト",()=>{closeSettings();logout()},"sitem dng"),vv);
   ov.append(nav,body);document.body.append(ov);
   setUi=uiOpen(()=>{setUi=0;closeSettings(true)});
   if(!MOB()||page)show(page||"acct");
@@ -4362,7 +4636,7 @@ async def index():
 
 @app.get("/api/version")
 async def app_version():
-    return JSONResponse({"v": APP_VERSION}, headers={"Cache-Control": "no-store"})
+    return JSONResponse({"v": APP_VERSION, "version": ver_str()}, headers={"Cache-Control": "no-store"})
 
 
 if __name__ == "__main__":
